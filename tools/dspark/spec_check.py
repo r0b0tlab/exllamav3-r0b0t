@@ -195,31 +195,41 @@ def task_bench(args, models, rows, result):
     target, draft, gen_plain, gen_spec = models.target, models.draft, models.gen_plain, models.gen_spec
     by_name = {r["name"]: r["ids"] for r in rows}
     res = {}
-    for arm in args.arms.split(","):
-        t0 = time.time()
-        r = run_arm(arm, rows, models)
-        res[arm] = r
-        s = summarize(r)
-        print(f"[bench] arm {arm:10s} {time.time() - t0:6.0f}s  " +
-              "  ".join(f"{c}: {v['tok_s']:.1f} tok/s AL {v['AL']:.2f}" for c, v in s.items()), flush = True)
-    out = {"summary": {a: summarize(r) for a, r in res.items()}, "divergence": {}}
-    plain = res.get("plain")
-    if plain is None and args.reference_tokens:
+    out = {"summary": {}, "divergence": {}, "errors": {}}
+    if args.keep_tokens:
+        out["tokens"] = {}
+    result["bench"] = out
+    reference = None
+    if args.reference_tokens:
         ref = json.load(open(args.reference_tokens))["bench"]["tokens"]["plain"]
         assert len(ref) == len(rows), "reference token streams do not match the prompt list"
-        plain = [{"name": r_["name"], "class": r_["class"], "tokens": t} for r_, t in zip(rows, ref)]
-    if plain:
-        for arm, r in res.items():
-            if arm == "plain":
-                continue
-            same = sum(1 for p, o in zip(plain, r) if p["tokens"] == o["tokens"])
+        reference = [{"name": r_["name"], "class": r_["class"], "tokens": t} for r_, t in zip(rows, ref)]
+    for arm in args.arms.split(","):
+        t0 = time.time()
+        try:
+            r = run_arm(arm, rows, models)
+        except Exception as e:
+            # an arm that cannot run must not cost the results of the others
+            import traceback
+            traceback.print_exc()
+            out["errors"][arm] = repr(e)
+            continue
+        res[arm] = r
+        s = summarize(r)
+        out["summary"][arm] = s
+        if args.keep_tokens:
+            out["tokens"][arm] = [r_["tokens"] for r_ in r]
+        print(f"[bench] arm {arm:10s} {time.time() - t0:6.0f}s  " +
+              "  ".join(f"{c}: {v['tok_s']:.1f} tok/s AL {v['AL']:.2f}" for c, v in s.items()), flush = True)
+        plain = res.get("plain") or reference
+        if plain and arm != "plain":
+            same = sum(1 for p_, o in zip(plain, r) if p_["tokens"] == o["tokens"])
             out["divergence"][arm] = {"identical": same, "of": len(r),
                                       "diverging": margin_report(models.rig, by_name, plain, r)}
             print(f"[bench] arm {arm}: {same}/{len(r)} streams identical to plain; diverging: "
                   f"{json.dumps(out['divergence'][arm]['diverging'])}", flush = True)
-    if args.keep_tokens:
-        out["tokens"] = {a: [r_["tokens"] for r_ in r] for a, r in res.items()}
-    result["bench"] = out
+        if args.out:
+            json.dump(result, open(args.out, "w"), indent = 1)
 
 
 # ----------------------------------------------------------------------------------------------------------- forced
@@ -234,7 +244,7 @@ def task_forced(args, models, rows, result):
     schedule = list(range(16)) + list(range(15, -1, -1))
     res = []
     orig = draft.sample_from_state
-    for r in rows[:args.forced_prompts]:
+    for r in rows[::13][:args.forced_prompts]:
         cont, _, _ = run_job(gen_plain, r["ids"], r["max_new"])
         truth = list(r["ids"]) + cont
         st = {"round": 0, "k": []}
@@ -606,7 +616,7 @@ def main():
     ap.add_argument("--device", default = "cuda:0")
     ap.add_argument("--cache-tokens", type = int, default = 8192)
     ap.add_argument("--batch", type = int, default = 4)
-    ap.add_argument("--forced-prompts", type = int, default = 3)
+    ap.add_argument("--forced-prompts", type = int, default = 6)
     ap.add_argument("--rollback-lengths", default = "40,246")
     ap.add_argument("--sampled-prompts", default = "gsm8k-003,ifeval-004")
     ap.add_argument("--samples", type = int, default = 2000)
@@ -643,6 +653,8 @@ def main():
     dcache_spec = Cache(draft, max_num_tokens = args.cache_tokens)
     cache_rb = Cache(target, max_num_tokens = 20 * 256, max_batch_size = 5, max_history = 15)
     dcache_rb = Cache(draft, max_num_tokens = 20 * 256)
+    cache_ctl = Cache(target, max_num_tokens = args.cache_tokens, max_batch_size = args.batch) \
+        if "plainc" in args.arms else None
     target.load(device, progressbar = False)
     draft.load(device, progressbar = False)
     tok = Tokenizer.from_config(tcfg)
@@ -652,7 +664,6 @@ def main():
     gen_plain_chunk = None
     if "plainc" in args.arms:
         # numerical control: the same plain decoding with the prompt prefilled in different chunks
-        cache_ctl = Cache(target, max_num_tokens = args.cache_tokens, max_batch_size = args.batch)
         gen_plain_chunk = Generator(model = target, cache = cache_ctl, tokenizer = tok, max_batch_size = args.batch,
                                     max_chunk_size = 64)
     gen_spec = Generator(model = target, cache = cache_spec, tokenizer = tok, max_batch_size = args.batch,
