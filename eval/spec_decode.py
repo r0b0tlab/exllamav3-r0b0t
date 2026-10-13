@@ -16,6 +16,9 @@ col_green = "\u001b[32;1m"  # Green
 
 prompt_files = [
     ("Trivial repetition", "trivial.json", False),
+    ("Math", "math_01.json", False),
+    ("Math", "math_02.json", False),
+    ("Math", "math_03.json", False),
     ("Agentic, code", "agentic_code_01.json", True),
     ("Agentic, code", "agentic_code_05.json", True),
     ("Agentic, code", "agentic_code_10.json", True),

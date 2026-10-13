@@ -1,0 +1,8 @@
+{
+    "messages": [
+        {
+            "role": "user",
+            "content": "A train travels 240 km at 60 km/h, then 150 km at 75 km/h. It stops for 20 minutes between the two legs. What is its average speed for the whole journey including the stop? Show your reasoning step by step, then give the final answer."
+        }
+    ]
+}

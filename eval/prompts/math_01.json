@@ -1,0 +1,8 @@
+{
+    "messages": [
+        {
+            "role": "user",
+            "content": "A bakery sells 24 cupcakes in the morning and half again as many in the afternoon. Each cupcake costs $3. If the bakery also pays $40 for ingredients that day, what is its profit? Show your reasoning step by step, then give the final answer."
+        }
+    ]
+}

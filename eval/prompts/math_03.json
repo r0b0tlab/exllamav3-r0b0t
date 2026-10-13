@@ -1,0 +1,8 @@
+{
+    "messages": [
+        {
+            "role": "user",
+            "content": "A shop buys 120 kg of apples at $2.50 per kg. It sells 70% of them at $4 per kg and the rest at a 30% discount off that price. What is the shop's total profit? Show your reasoning step by step, then give the final answer."
+        }
+    ]
+}
