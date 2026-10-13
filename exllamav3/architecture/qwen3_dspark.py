@@ -2,10 +2,15 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 
+from ..modules.arch_specific.dspark_markov import (
+    DSparkHeads, markov_candidates, markov_walk, markov_confidence,
+)
+from ..util.device_copy import to_device
+from ..util.tensor import get_for_device
 from .dflash import DFlashConfig, DFlashModel
 
 """
-DSpark draft (Qwen3DSparkModel; openbmb/MiniCPM-V-4.7-35B-A3B-DSpark), quantization shim.
+DSpark draft (Qwen3DSparkModel; openbmb/MiniCPM-V-4.7-35B-A3B-DSpark): config reader, quantization shim, drafting.
 
 Attribution: the tensor layout, the head semantics and the depth convention below were read from vLLM
 (vllm/model_executor/models/qwen3_dspark.py and vllm/v1/worker/gpu/spec_decode/dspark/speculator.py, Apache-2.0,
@@ -48,18 +53,24 @@ How the open design questions were settled (from config.json and the vLLM source
   defaults to True: "anchor + N-1 noise, NOT 1 + N; every query position is a prediction", the anchor row predicts
   the first draft). config.json does not set sample_from_anchor, so the default applies.
 
-NOT built here (marked TODO below):
+Generation (Qwen3DSparkModel.sample_from_state):
 
-- TODO(generator): the inherited DFlash generation path is NOT valid for this draft. DFlashModel advertises
-  default_draft_size = block_size - 1 and the generator crops the anchor row (new_ids[:, 1:]) because a DFlash mask
-  row predicts its own position. DSpark rows are shifted by one (anchor row = draft 1, 15 drafts per round) and
-  the logits need the Markov bias (bias_k = markov_w1[x_{k-1}] @ markov_w2^T, sampled left to right; the engine
-  walks the top-K candidates only). sample_from_state therefore raises: fork-side acceptance numbers from the stock
-  generator would be misaligned. Drafting is left to a DSpark-capable inference engine.
-- TODO(calibrated): a calibrated arm needs Hessians from real target taps. Approach: accumulate x^T x over ~1k target
-  sequences for (a) the 5 concatenated taps (fc), (b) the hidden_norm output (k/v of all 5 layers) and (c) the block
-  states (q/o, gate/up, down), then Linear.convert_exl3(H_data) as util/convert_mtp.py does. Until then the model
-  is uncalibrated-only (caps["uncalibrated_quantize"], H = identity).
+- One draft round is one forward over the block [anchor, mask x (block_size - 1)] at positions P .. P + block_size - 1
+  (P = number of target-processed tokens), attending non-causally to the committed context rows and the whole block.
+  Every block row is a next-token prediction (the anchor row predicts the first draft), so a round yields block_size
+  drafts, and the generator verifies block_size + 1 target rows (anchor + drafts). The sampler returns the ids in the
+  layout [anchor, drafts...] the generator's DFlash path already consumes (it crops the leading anchor).
+- The base logits come from the target's LM head. The Markov bias markov_w1[x_{k-1}] @ markov_w2^T is evaluated for the
+  top-K base candidates of each row only (K = markov_top_k, default 64; the reference measured -3.8% accepted length
+  against the full-vocabulary walk at K = 64, -6% at 32, -9% at 16) by the DFlash2 selector-walk kernels.
+- The proposals are greedy, so verification by sample-and-compare is exact for greedy and for sampled decoding.
+- The confidence head is exported through params["draft_conf"] (dynamic_draft_tokens) and, when draft_conf_threshold
+  is set, as params["draft_confidence_len"]; neither changes the output, only how many drafts are verified.
+
+TODO(calibrated): a calibrated arm needs Hessians from real target taps. Approach: accumulate x^T x over ~1k target
+sequences for (a) the 5 concatenated taps (fc), (b) the hidden_norm output (k/v of all 5 layers) and (c) the block
+states (q/o, gate/up, down), then Linear.convert_exl3(H_data) as util/convert_mtp.py does. Until then the model
+is uncalibrated-only (caps["uncalibrated_quantize"], H = identity).
 """
 
 
@@ -157,6 +168,9 @@ class Qwen3DSparkConfig(DFlashConfig):
 class Qwen3DSparkModel(DFlashModel):
     config_class = Qwen3DSparkConfig
 
+    # Directory of the Markov / confidence tensors (module key of DSparkHeads)
+    key_heads = "markov_head"
+
     def __init__(
         self,
         config: Qwen3DSparkConfig,
@@ -169,6 +183,33 @@ class Qwen3DSparkModel(DFlashModel):
             # The anchor row is the first draft: block_size drafts per round (DFlash: block_size - 1)
             "default_draft_size": config.block_size,
         })
+
+        # Raw Markov / confidence tensors, identity in the module walk (after the final norm)
+        self.heads = DSparkHeads(
+            config = config,
+            key = self.key_heads,
+            vocab_size = config.vocab_size,
+            rank = config.markov_rank,
+            confidence_in = config.confidence_in if config.enable_confidence_head else None,
+        )
+        self.modules += [self.heads]
+
+        # Candidates per row the Markov bias is evaluated for (top-K of the base logits)
+        self._markov_top_k = 64
+        # With the confidence head: keep only the leading drafts whose confidence is at least this (None: all)
+        self.draft_conf_threshold = None
+
+
+    @property
+    def markov_top_k(self) -> int:
+        return self._markov_top_k
+
+
+    @markov_top_k.setter
+    def markov_top_k(self, k: int):
+        if not 1 <= k <= self.config.vocab_size:
+            raise ValueError(f"markov_top_k must be between 1 and the vocabulary size, got {k}")
+        self._markov_top_k = int(k)
 
 
     @override
@@ -190,7 +231,18 @@ class Qwen3DSparkModel(DFlashModel):
         if any(not 0 <= layer_id < target.config.num_hidden_layers
                for layer_id in self.config.target_layer_ids):
             raise ValueError("DSpark target_layer_ids contains a layer outside the target model")
+        if target.logit_layer_idx is None:
+            raise ValueError("DSpark target has no compatible LM head")
         super().attach_to(target)
+
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        assert input_ids.shape[-1] == 1, \
+            "DSpark expects one verified anchor token per draft block"
+        # The Markov walk starts from the anchor token
+        params["dspark_anchor_ids"] = input_ids
+        return super().prepare_inputs(input_ids, params)
 
 
     @override
@@ -199,11 +251,45 @@ class Qwen3DSparkModel(DFlashModel):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        raise NotImplementedError(
-            "Qwen3DSparkModel: the stock DFlash sampling and anchor-crop path is not valid for DSpark "
-            "(anchor row is draft 1, the Markov head biases the logits). The fork converts and loads this "
-            "draft; drafting is left to a DSpark-capable inference engine. See the module docstring, TODO(generator)."
-        )
+        """
+        Target LM head over all block rows, top-K candidates per row from the base logits, then the Markov walk over
+        the candidates, left to right from the anchor. Row k predicts the token after row k, so all block_size rows
+        are drafts. Returns (bsz, block_size + 1) ids [anchor, drafts...]: the generator crops the anchor.
+
+        With params["export_draft_conf"], params["draft_conf"] receives (bsz, block_size + 1) scores [0, confidence...]
+        aligned with those ids. With draft_conf_threshold set, params["draft_confidence_len"] receives the longest
+        prefix of drafts, over the batch, whose confidence is at least the threshold (0: skip drafting this round)
+        """
+        target = self.attached_model()
+        lm = target.modules[target.logit_layer_idx]
+        logits = lm.prepare_for_device(state.half(), params)
+        logits = lm.forward(logits, params)
+
+        heads = self.heads
+        dev = heads.device
+        logits = to_device(logits, dev)
+        # The generator stages the anchor ids in pinned memory: upload without a host sync
+        anchor = get_for_device(params, "dspark_anchor_ids", dev)[:, -1]
+
+        vocab = target.config.vocab_size
+        top_k = min(self._markov_top_k, vocab)
+        unary, cands = markov_candidates(logits, vocab, top_k)
+        out = markov_walk(unary, cands, anchor, heads.w1, heads.w2)
+
+        thr = self.draft_conf_threshold
+        if params.get("export_draft_conf") or thr is not None:
+            bsz, rows = out.shape[0], out.shape[1] - 1
+            if heads.has_confidence:
+                conf = markov_confidence(to_device(state, dev), out[:, :-1], heads.w1, heads.conf_w, heads.conf_b)
+            else:
+                # No confidence head: the winning base logit separates good from degenerate rows
+                conf = unary[..., 0]
+            if params.get("export_draft_conf"):
+                params["draft_conf"] = torch.cat((conf.new_zeros((bsz, 1)), conf), dim = 1)
+            if thr is not None and heads.has_confidence:
+                run = torch.cumprod((conf >= thr).to(torch.int32), dim = 1).sum(dim = 1)
+                params["draft_confidence_len"] = int(run.max().item())
+        return out
 
 
     @classmethod

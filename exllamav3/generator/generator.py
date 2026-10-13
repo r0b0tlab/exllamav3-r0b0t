@@ -251,6 +251,14 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        # A block drafter proposes a fixed number of tokens per round, num_draft_tokens may only shorten the window
+        if self.dflash_draft:
+            native = self.draft_model.caps.get("default_draft_size")
+            if native and self.num_draft_tokens > native:
+                raise ValueError(
+                    f"num_draft_tokens = {self.num_draft_tokens} exceeds the {native} tokens this draft model "
+                    f"proposes per round."
+                )
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
