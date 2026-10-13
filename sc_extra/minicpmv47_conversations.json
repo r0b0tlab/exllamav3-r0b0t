@@ -1,0 +1,144 @@
+[
+ [
+  "The following is the OCR output of a scanned invoice (line breaks preserved):\n\nACME INDUSTRIAL SUPPLY CO.\n1450 Harbor Blvd, Suite 12, Long Beach, CA 90802\nINVOICE # 2024-08817        DATE: 03/14/2025\nBILL TO: Northwind Fabrication LLC, 77 Mill Rd, Tulsa OK 74103\nQTY  DESCRIPTION                     UNIT     TOTAL\n12   Hex bolt M10x60 (box of 50)     18.40    220.80\n4    Torque wrench 3/8in             64.95    259.80\n30   Nitrile gloves L (case)         41.10  1,233.00\n                      SUBTOTAL            1,713.60\n                      TAX 8.75%             149.94\n                      TOTAL DUE           1,863.54\nTerms: Net 30. Late fee 1.5%/month.\n\nExtract vendor, invoice number, date, bill-to, each line item and the totals as JSON, and check whether the arithmetic is consistent.",
+  [
+   "Flag anything in the OCR text that might be a recognition error and say how you would verify it."
+  ]
+ ],
+ [
+  "This is OCR text from a photographed restaurant receipt, with noise:\n\nGolden Dr4gon Noodle Bar\nTable 7   Server: Mei   03/02 19:41\n1 Dan Dan Noodles        13.50\n2 Pork Dumplings (6pc)   2 x 9.00\n1 Jasmine Tea Pot         5.25\n1 Mango Sticky Rice       8.00\nSubtotal                 44.75\nTip 18%                   8.06\nTotal                    52.8l\n\nCorrect the OCR errors you can justify, recompute the totals, and tell me what each person pays if three people split it evenly.",
+  []
+ ],
+ [
+  "Below is the text layer of a two-column scientific paper page where the columns were interleaved by a naive extractor:\n\n3.2 Experimental setup  Table 2 lists the hyper-\nWe train all models for 90 epochs with parameters. The learning rate is warmed up\nSGD (momentum 0.9). The batch size is for 5 epochs and then decayed with a cosine\n256 and the weight decay 1e-4. schedule. Gradient clipping at 1.0 is used\nfor the transformer variants only.\n\nReconstruct the two columns in the correct reading order and summarize the training recipe as a bullet list.",
+  []
+ ],
+ [
+  "以下是一张体检报告的OCR识别结果，可能存在识别错误：\n\n姓名：张某某  性别：男  年龄：46\n项目        结果     参考范围    单位\n空腹血糖    6.9      3.9-6.1     mmol/L\n总胆固醇    5.8      <5.2        mmol/L\n甘油三酯    2.31     <1.70       mmol/L\n低密度脂蛋白 3.9     <3.4        mmol/L\n血压        148/94   <140/90     mmHg\n\n请把异常项目整理成表格，并用通俗的话解释每一项，最后给出生活方式建议（不构成医疗诊断）。",
+  [
+   "请把上面的表格翻译成英文，保留数值与单位。"
+  ]
+ ],
+ [
+  "Here is a table recovered from a PDF with OCR; some cells were merged:\n\nRegion | Q1 | Q2 | Q3 | Q4\nNorth | 120 | 135 | 150 | 162\nSouth | 98 | 101 | 99 | 110\nEast | 143 | 150 | 148 | 170\nWest | 87 | 90 | 104 | 118\n\nCompute the yearly totals per region and per quarter, identify the fastest-growing region quarter over quarter, and present the result as a markdown table followed by a two-sentence commentary.",
+  []
+ ],
+ [
+  "A handwritten note was transcribed by a recognizer as follows (confidence marked in brackets):\n\n'Dear Mrs. Okafor [0.93], please [0.97] leave the parcel with the neighbour at no. [0.61] 14 B [0.52] if I am not home. Thank you, Tom [0.88].'\n\nWhich tokens are uncertain, what are the plausible alternatives for each, and what would you ask a human reviewer to confirm?",
+  []
+ ],
+ [
+  "A line chart shows monthly active users for two apps over 12 months. Reading off the chart: App A grows 10k, 12k, 15k, 19k, 24k, 30k, 36k, 41k, 45k, 48k, 50k, 51k. App B is flat at 20k until month 6, then jumps to 28k, 33k, 38k, 44k, 52k, 61k, 70k. Describe the shape of both curves, when B overtakes A, and what the growth pattern suggests about each product's lifecycle.",
+  [
+   "Fit a simple logistic curve to App A by choosing parameters, and say how good the fit is."
+  ]
+ ],
+ [
+  "A bar chart (horizontal) ranks programming languages by survey share: Python 28%, JavaScript 21%, Java 12%, C# 8%, C++ 7%, Go 5%, Rust 4%, Other 15%. A pie chart on the next slide shows the same data. Write the alt text for the bar chart, a one-paragraph takeaway, and point out one misleading way to draw this chart.",
+  []
+ ],
+ [
+  "A scatter plot has x = hours studied (0-10) and y = exam score (0-100). Points cluster along a line from (1, 38) to (9, 91), with two outliers at (8, 40) and (2, 85). Describe the relationship, estimate the slope and intercept, and explain what each outlier could represent. Which statistics would you report and why?",
+  []
+ ],
+ [
+  "A stacked area chart shows energy production by source from 2000 to 2024. Coal falls from 52% to 18%, gas rises 16% to 37%, nuclear holds near 19% then 14%, wind and solar rise from under 1% to 24% combined, hydro is steady near 7%. Write a neutral three-paragraph caption for a report, then list the numerical claims a fact-checker should verify.",
+  []
+ ],
+ [
+  "A box plot compares response times (ms) of three services: A median 120 (IQR 100-150, whiskers 70-210), B median 95 (IQR 80-170, whiskers 40-420), C median 140 (IQR 130-150, whiskers 110-175). Which service would you choose for an interactive feature and which for a batch job, and why? What does the plot hide?",
+  []
+ ],
+ [
+  "A screenshot of a mobile banking app was converted to this accessibility tree:\n\nWindow 'Accounts'\n  Header 'Good evening, Priya'\n  Card 'Checking ••4821' balance '$3,204.17' button 'Details'\n  Card 'Savings ••9033' balance '$12,880.00' button 'Details'\n  Banner 'Your card payment of $240.00 is due in 2 days' button 'Pay now'\n  TabBar: 'Accounts' (selected) | 'Pay & transfer' | 'Cards' | 'Insights'\n\nDescribe what the screen shows to a visually impaired user, then list the three most likely next actions and the tab each would be in.",
+  []
+ ],
+ [
+  "Here is the DOM of a signup form (simplified):\n\n<form>\n <label>Email <input type=email required></label>\n <label>Password <input type=password minlength=8></label>\n <label>Confirm <input type=password></label>\n <input type=checkbox id=tos> <label for=tos>I accept the terms</label>\n <button disabled>Create account</button>\n</form>\n\nIdentify accessibility and usability problems (labels, error messaging, button state), and rewrite the markup with improvements.",
+  []
+ ],
+ [
+  "A screenshot of a spreadsheet was transcribed as CSV:\n\nitem,jan,feb,mar,total\nHosting,120,120,135,375\nDesign,800,0,650,1450\nTools,45,45,45,135\nMarketing,300,420,380,1100\n,,,,\nTotal,1265,585,1210,3060\n\nVerify the totals and find any inconsistency. Write the formulas that would have produced the total column and the total row.",
+  []
+ ],
+ [
+  "Image description (from an annotator): 'A street market at dusk. In the foreground a woman in a yellow raincoat hands a paper bag to a boy holding a red umbrella. Behind them a stall sells citrus fruit under a striped awning; a chalkboard reads \"Oranges 3 for $5\". Further back, two cyclists wait at a crossing while a tram passes left to right. Puddles reflect the string lights overhead.' Answer: (1) What is the price of oranges per fruit? (2) Which direction is the tram moving? (3) What colours appear in the scene? (4) What is the weather and how do you know? Then write a 60-word alt text.",
+  []
+ ],
+ [
+  "Dense caption of a kitchen photo: 'Left to right along the counter: a toaster, a bowl of green apples, a knife block with five knives, a stand mixer. Above the counter hang three copper pans. A window above the sink shows a garden; on the sill sits a potted basil plant and a blue mug. On the floor, a grey cat sleeps next to an open dishwasher whose bottom rack is loaded with plates.' Questions: how many knives, how many pans, what is the cat doing, what is next to the cat, and what could go wrong if someone walks in carrying a hot pot? Answer concisely.",
+  []
+ ],
+ [
+  "Three photos were captioned: (A) 'a golden retriever catching a frisbee on a beach, waves behind, midday sun', (B) 'the same dog asleep on a couch with a striped blanket, lamp on', (C) 'a golden retriever puppy in a cardboard box, studio lighting'. Which two photos could show the same dog at different ages, what evidence is there and what is missing, and how would you describe the set as an album?",
+  []
+ ],
+ [
+  "A satellite image of a coastal town was described as: 'a river meets the sea on the east; a harbour with a long breakwater to the south; a grid of streets north of the river; a large rectangular green area west of the grid; a bridge crossing the river at its widest point; scattered white rectangles (greenhouses) to the far north.' Draw an ASCII sketch map with N at the top, then answer: which neighbourhood would flood first in a storm surge and why?",
+  []
+ ],
+ [
+  "A museum label reads (OCR): 'Vase, Attic red-figure, c. 480 BC. Attributed to the Berlin Painter. Scene: a youth with a lyre between two athletes. Provenance: gift of E. M. Hollis, 1932. Condition: repaired from fragments; modern restoration to the handle.' Write a 120-word explanation for a general audience, then list five questions a curious visitor might ask.",
+  []
+ ],
+ [
+  "A diagram shows triangle ABC with a right angle at B. AB = 6, BC = 8. A circle is inscribed in the triangle and touches AB at D, BC at E and CA at F. A line from B is drawn perpendicular to AC meeting it at H. Find AC, the inradius, BH, and the lengths AD, BE and CF. Show the reasoning.",
+  [
+   "Now compute the area of the triangle formed by D, E and F."
+  ]
+ ],
+ [
+  "A circuit diagram: a 12 V source in series with a 100 ohm resistor R1; after R1 the current splits into two parallel branches, one with a 200 ohm resistor R2 and the other with a 300 ohm resistor R3 in series with a 10 uF capacitor. The branches rejoin and return to the source. At steady state (DC), what is the current from the source and the voltage across the capacitor? What changes right after the switch is closed?",
+  []
+ ],
+ [
+  "A food-web figure shows: grass -> grasshopper -> frog -> snake -> hawk; grass -> rabbit -> hawk; grass -> rabbit -> fox; grasshopper -> sparrow -> hawk. Write the trophic level of each organism, identify the apex predators, and predict the effect of removing the frogs, step by step.",
+  []
+ ],
+ [
+  "A flowchart: Start -> read n -> set i=1, s=0 -> decision 'i <= n?' -> (yes) s = s + i*i, i = i + 1, loop back; (no) print s -> End. Translate the flowchart into Python, trace it for n = 4, and state what closed-form expression it computes.",
+  []
+ ],
+ [
+  "A phase diagram of water (pressure vs temperature, log scale) is described: the solid-liquid line slopes slightly to the left; the triple point is at 0.01 C and 611 Pa; the critical point at 374 C and 22.06 MPa. Explain why ice melts under pressure, why freeze-drying works at low pressure, and what happens above the critical point.",
+  []
+ ],
+ [
+  "A 20-second video was sampled at 1 frame per 4 seconds and captioned: t=0 'a person in a lab coat pours blue liquid into a flask'; t=4 'the flask is placed on a hot plate, a thermometer reads 25 C'; t=8 'bubbles form, thermometer reads 62 C'; t=12 'the liquid has turned green, the person adds a white powder'; t=16 'the mixture foams over the rim of the flask'. Write a coherent step-by-step account of what happened, what likely went wrong at the end and what safety measures are visible or missing.",
+  []
+ ],
+ [
+  "Frames from a traffic camera at 1 s intervals: f1 'white van in the left lane, grey sedan behind it'; f2 'sedan moves into the right lane'; f3 'sedan alongside van, a cyclist enters the crossing from the right'; f4 'sedan brakes, van continues'; f5 'cyclist halfway across, sedan stopped, van gone'. Describe the sequence of events, who yielded to whom, and whether any rule was violated, noting what cannot be determined from these frames.",
+  []
+ ],
+ [
+  "A cooking video's keyframes: 1 'onions diced on a board'; 2 'onions in a pan with oil, medium heat'; 3 'onions golden, garlic added'; 4 'tomatoes poured in, lid on'; 5 'sauce stirred, basil added'; 6 'sauce spooned over pasta in a bowl'. Write the recipe as numbered steps with times and quantities you consider reasonable, and list the equipment used.",
+  []
+ ],
+ [
+  "Two product photos were described. Photo 1: 'a black over-ear headphone, silver hinges, a braided cable plugged into the left cup, folded flat in a hard case'. Photo 2: 'a black over-ear headphone, gold hinges, a detachable USB-C cable, a small switch on the right cup, folded in a soft pouch'. List differences in a table, infer which is likely newer or more expensive and why, and write the two-sentence listing title and blurb for each.",
+  []
+ ],
+ [
+  "Before/after photos of a garden: before - 'bare soil, one lemon tree in the north-east corner, a wooden fence on the west side, a gravel path along the south'; after - 'raised beds in two rows, the lemon tree now with a stake, climbing beans on the fence, a stepping-stone path replacing gravel, a rain barrel at the south-west corner'. Summarize what changed, estimate effort and materials for each change, and suggest three follow-up improvements.",
+  []
+ ],
+ [
+  "一张餐厅菜单的OCR文本如下：\n\n招牌麻辣香锅 68元（小）/ 98元（大）\n酸菜鱼 78元\n宫保鸡丁 38元\n蒜蓉空心菜 26元\n米饭 3元/碗\n酸梅汤 12元/杯\n\n四个人，其中一人不吃辣，预算300元以内，请给出点餐方案并计算总价，说明理由。",
+  [
+   "如果加一道饮品并且每人一碗米饭，总价是多少？是否超出预算？"
+  ]
+ ],
+ [
+  "下面是一张公交线路图的文字描述：'1号线从火车站出发，经过市政府、人民医院、中心广场、大学城、科技园，终点是机场；2号线与1号线在中心广场交叉，向东依次经过体育馆、动物园、植物园，向西经过老城区、古塔。' 请回答：从古塔到大学城最少换乘几次？列出路线，并说明每一段的乘坐线路。",
+  []
+ ],
+ [
+  "请根据下面对图片的描述写一段适合发朋友圈的文案（三种风格：文艺、幽默、简洁），并各配两个话题标签：'清晨的山谷里起了薄雾，一间木屋的烟囱冒着炊烟，远处的梯田被朝阳染成金色，近处的溪边有一只白鹭。'",
+  []
+ ],
+ [
+  "在一张折线图中，某城市2018到2023年的新能源汽车保有量（万辆）依次为：12、25、48、90、160、270。请描述趋势，计算每年的同比增长率，并判断增速是否在放缓，给出可能的原因（至少三点）。",
+  []
+ ]
+]

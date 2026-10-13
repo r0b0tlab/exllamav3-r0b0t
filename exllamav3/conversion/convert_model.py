@@ -5,7 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
-from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers, quantize_exl3
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -24,6 +24,7 @@ except ImportError:
     def rpc(*a, **k):
         raise RuntimeError("remote quant support not present (single-node tree)")
 from .compile import compile_model, dsize
+from . import retry_outliers as ro
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
@@ -102,6 +103,12 @@ parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save 
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
+parser.add_argument("--dump_hessians", type = str, default = None, help = "Write each module's raw captured Hessians (fp32 sum of x^T x before finalization, one file per module) to this directory, so a later repair can re-encode with the exact Hessians. Off by default; output unchanged")
+parser.add_argument("--retry_outliers", action = "store_true", help = "Re-encode a matrix with other seeds (idx + 1000 k, k <= --retry_max_seeds) when its proxy error is > --retry_ratio x its peer group's median or its global scale < --retry_min_gscale (encoder scale-search collapse). Retried matrices and winning seeds go to <work_dir>/retry_outliers.jsonl and <out_dir>/exl3_retry_log.json. Off by default; output unchanged")
+parser.add_argument("--retry_ratio", type = float, default = None, help = "--retry_outliers: proxy error ratio over the group median, default: 5")
+parser.add_argument("--retry_min_gscale", type = float, default = None, help = "--retry_outliers: global scale below which a matrix is re-encoded, default: 0.2")
+parser.add_argument("--retry_max_seeds", type = int, default = None, help = "--retry_outliers: seeds tried per matrix, default: 32")
+parser.add_argument("--retry_budget", type = int, default = None, help = "--retry_outliers: re-encode budget per module in units of 4M weights, default: 1024")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
@@ -276,6 +283,12 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mul1"),
+        ("dump_hessians", True, ""),
+        ("retry_outliers", True, False),
+        ("retry_ratio", True, ro.DEFAULT_RATIO),
+        ("retry_min_gscale", True, ro.DEFAULT_MIN_GSCALE),
+        ("retry_max_seeds", True, ro.RETRY_MAX_SEEDS),
+        ("retry_budget", True, 1024),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -447,7 +460,34 @@ def make_quant_args(args, idx, K, devices, device_ratios = None):
     return quant_args
 
 
+# --retry_outliers bookkeeping: while a module is being quantized, every finished linear reports its result here
+# (all four dispatch paths end in print_quantized_linear). None whenever the option is off.
+_retry_results = None
+_retry_results_lock = threading.Lock()
+
+
+def retry_capture_begin():
+    global _retry_results
+    _retry_results = {}
+
+
+def retry_capture_end():
+    global _retry_results
+    results, _retry_results = _retry_results, None
+    return results
+
+
 def print_quantized_linear(config, linear, quant_args, proxy_err, time_str = ""):
+    if _retry_results is not None:
+        with _retry_results_lock:
+            _retry_results[linear.key] = {
+                "proxy_err": float(proxy_err),
+                "g_scale": float(quant_args["g_scale"]),
+                "K": quant_args["K"],
+                "q_fallback": bool(quant_args["q_fallback"]),
+                "zeros": bool(quant_args.get("zeros")),
+                "seed": quant_args.get("seed"),
+            }
     flags = "o" if quant_args["apply_out_scales"] else "."
     flags += "f" if quant_args["q_fallback"] else "."
     proxy_err_str = (
@@ -466,6 +506,140 @@ def print_quantized_linear(config, linear, quant_args, proxy_err, time_str = "")
         f"{time_str}",
         flush = True
     )
+
+
+def dump_raw_hessians(dump_dir, module, slice_idx, capture_H, linears):
+    """
+    --dump_hessians: write the module's captured Hessians exactly as the pipeline holds them before
+    finalize_capture_H touches them: fp32, the plain SUM of x^T x over `count` rows (not divided by count, no
+    diagonal damping, no sign flips, no Hadamard, no LDL). With these a repair re-runs finalize_capture_H +
+    quantize_exl3 on one matrix with another seed and gets the encode the pipeline would have produced.
+    One file per module (per slice for sliced modules), tensors named by qmap, the mapping linear key -> qmap and
+    each qmap's count / num_total / first_key / inf_nan in the safetensors metadata. Returns the file size.
+    """
+    os.makedirs(dump_dir, exist_ok = True)
+    fname = module.key + (f".s{slice_idx}" if slice_idx is not None else "") + ".hessian.safetensors"
+    path = os.path.join(dump_dir, fname)
+    tensors, info = {}, {}
+    for qmap, hd in capture_H.items():
+        H = hd["H"]
+        if H.is_meta:
+            continue
+        tensors[qmap] = H.detach().cpu().contiguous()
+        info[qmap] = {
+            "k": H.shape[0],
+            "count": int(hd["count"]),
+            "num_total": int(hd["num_total"]),
+            "first_key": hd.get("first_key"),
+            "inf_nan": [int(v) for v in hd["inf_nan"].tolist()],
+        }
+    metadata = {
+        "format": "exl3-raw-hessian-v1",
+        "module": module.key,
+        "slice": "" if slice_idx is None else str(slice_idx),
+        "qmaps": json.dumps(info),
+        "linear_qmap": json.dumps({l.key: l.qmap for l in linears if l.qmap in tensors}),
+        "sigma_reg_default": "0.025",
+    }
+    tmp = path + ".tmp"
+    save_file(tensors, tmp, metadata)
+    os.replace(tmp, path)
+    return os.path.getsize(path)
+
+
+def snapshot_raw_H(capture_H, linears):
+    """--retry_outliers: private copy of the captured Hessians the module's linears use (finalize_capture_H divides,
+    damps and transforms H in place, and for CPU-resident modules that is the captured tensor itself)."""
+    snap = {}
+    for linear in linears:
+        qmap = linear.qmap
+        if qmap in capture_H and qmap not in snap:
+            hd = capture_H[qmap]
+            snap[qmap] = {
+                "H": hd["H"].clone(),
+                "H_swap_device": hd.get("H_swap_device", hd["H"].device),
+                "first_key": hd.get("first_key"),
+                "count": hd["count"],
+                "num_total": hd["num_total"],
+                "inf_nan": hd["inf_nan"].clone(),
+                "device": hd.get("device"),
+            }
+    return snap
+
+
+def retry_module_outliers(args, module_key, linears, strategy, idx, device, orig_weights, orig_biases, raw_H, results):
+    """
+    --retry_outliers: after a module has been quantized, re-encode the matrices whose result looks like a scale
+    search collapse (ro.find_outliers) with seeds idx + 1000 k, k = 1 .. --retry_max_seeds, from the original weight
+    and the raw Hessian snapshot (so a retry is the encode the pipeline would have made with that seed). The first
+    acceptable candidate is installed; if none is, the best of all candidates (the original included) is kept and
+    the matrix is logged as unresolved. Every retried matrix is appended to <work_dir>/retry_outliers.jsonl.
+    """
+    ratio, min_gs = args["retry_ratio"], args["retry_min_gscale"]
+    outliers, medians = ro.find_outliers(results, ratio, min_gs)
+    if not outliers:
+        return 0
+    by_key = {l.key: l for l in linears}
+    log_path = os.path.join(args["work_dir"], "retry_outliers.jsonl")
+    budget = args["retry_budget"]
+    print(f" -- Retry: {len(outliers)} outlier matrices in {module_key} "
+          f"(proxy_err > {ratio:g} x group median or g_sc < {min_gs:g})", flush = True)
+    n_replaced = 0
+    for key, reason in outliers.items():
+        linear = by_key[key]
+        K = strategy[key]
+        orig = results[key]
+        med = medians.get(ro.group_key(key, K))
+        cost = max(1, linear.weights_numel() // (4 << 20))
+        cands = [{"seed": orig["seed"], "k": 0, "proxy_err": orig["proxy_err"], "g_scale": orig["g_scale"]}]
+        outs = [None]
+        for k in range(1, args["retry_max_seeds"] + 1):
+            if budget < cost:
+                print(f" !! Retry budget of {module_key} exhausted, {key} keeps the best encode so far", flush = True)
+                break
+            budget -= cost
+            seed = ro.retry_seed(idx, k)
+            qa = make_quant_args(args, seed, K, [device.index])
+            h = raw_H[linear.qmap]
+            h_data = {
+                "H": h["H"].clone(), "H_swap_device": h["H_swap_device"], "first_key": h["first_key"],
+                "count": h["count"], "finalized": False, "num_total": h["num_total"],
+                "inf_nan": h["inf_nan"].clone(), "device": h["device"],
+            }
+            try:
+                _, pe, out_t = quantize_exl3(orig_weights[key].float(), h_data, qa, False, None, False)
+                c = {"seed": seed, "k": k, "proxy_err": float(pe), "g_scale": float(qa["g_scale"])}
+            except Exception as e:
+                # The guard must never take the conversion down: a failed retry is just a candidate that lost
+                print(f" !! Retry encode failed for {key} (seed {seed}): {type(e).__name__}: {e}", flush = True)
+                c = {"seed": seed, "k": k, "proxy_err": None, "g_scale": None, "error": f"{type(e).__name__}: {e}"}
+                out_t = None
+            cands.append(c)
+            outs.append(out_t)
+            if ro.acceptable(c["proxy_err"], c["g_scale"], med, ratio, min_gs):
+                break
+        resolved = len(cands) > 1 and ro.acceptable(cands[-1]["proxy_err"], cands[-1]["g_scale"], med, ratio, min_gs)
+        win = len(cands) - 1 if resolved else ro.pick_best(cands)
+        if win > 0:
+            install_exl3_from_tensors(linear, outs[win], orig_biases[key])
+            linear.inner.swap_cpu()
+            n_replaced += 1
+        w = cands[win]
+        print(
+            f" -- Retried: {key:{len(key) + 2}}  proxy_err: {orig['proxy_err']:.6f} -> {w['proxy_err']:.6f}"
+            f"  g_sc: {orig['g_scale']:.6f} -> {w['g_scale']:.6f}"
+            f"  seed: {cands[0]['seed']} -> {w['seed']}  tries: {len(cands) - 1}"
+            + ("" if resolved else "  !! UNRESOLVED"),
+            flush = True
+        )
+        rec = {
+            "key": key, "module": module_key, "idx": idx, "K": K, "trigger": reason, "group_median": med,
+            "original": cands[0], "tries": cands[1:], "winner": w, "resolved": resolved,
+        }
+        with open(log_path, "a", encoding = "utf8") as f:
+            f.write(json.dumps(rec) + "\n")
+        outs[win] = None
+    return n_replaced
 
 
 def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 32768, max_stack = 16):
@@ -1370,6 +1544,22 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
+            # Opt-in, both off by default and then nothing below runs: dump the raw Hessians, and keep
+            # what a re-encode of outlier matrices needs (raw H, original weights, biases)
+            if args.get("dump_hessians") and capture_H:
+                nbytes = dump_raw_hessians(
+                    args["dump_hessians"], module, current_slice if slicing else None, capture_H, linears
+                )
+                print(f" -- Dumped Hessians: {module.key}{slice_str} ({nbytes / 1024**2:.1f} MB)", flush = True)
+            retry_ctx = None
+            if args.get("retry_outliers") and state is not None and capture_H:
+                retry_ctx = (
+                    snapshot_raw_H(capture_H, linears),
+                    {l.key: l.inner.get_weight_tensor() for l in linears if strategy[l.key] != 16},
+                    {l.key: l.inner.get_bias_tensor() for l in linears},
+                )
+                retry_capture_begin()
+
             # Quantize: one linear per device in parallel when the layer has enough
             # tensors to occupy every device, else tile-split each tensor across devices
             # (single large tensors, e.g. lm_head)
@@ -1382,6 +1572,15 @@ def main(args, job_state):
                 quantize_linears_parallel(args, linears, config, strategy, idx, qdevs, qratios, capture_H, state)
             else:
                 quantize_linears_single(args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state)
+
+            # --retry_outliers: re-encode matrices that look like a scale search collapse (seeds idx + 1000 k)
+            if retry_ctx is not None:
+                retry_raw_H, retry_weights, retry_biases = retry_ctx
+                retry_module_outliers(
+                    args, module.key + slice_str, linears, strategy, idx, device,
+                    retry_weights, retry_biases, retry_raw_H, retry_capture_end()
+                )
+                retry_ctx = retry_raw_H = retry_weights = retry_biases = None
 
             # Collect converted module tensors
             for m in module:

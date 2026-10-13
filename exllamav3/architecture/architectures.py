@@ -35,6 +35,7 @@ from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
+from .minicpmv4_7 import MiniCPMV4_7Model
 from .ministral3 import Ministral3Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
@@ -48,6 +49,7 @@ from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
+from .qwen3_dspark import Qwen3DSparkModel
 from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
 from .qwen4_exp import Qwen4ExpModel
 from .qwen3_moe import Qwen3MoeModel
@@ -106,6 +108,7 @@ ARCHITECTURES = {
         LlamaModel,
         MiMoModel,
         MiniMaxM2Model,
+        MiniCPMV4_7Model,
         Ministral3Model,
         MistralModel,
         Mistral3Model,
@@ -119,6 +122,7 @@ ARCHITECTURES = {
         Qwen2Model,
         Qwen2_5VLModel,
         Qwen3Model,
+        Qwen3DSparkModel,
         Qwen3_5Model,
         Qwen3_5MoeModel,
         Qwen3_5VLModel,

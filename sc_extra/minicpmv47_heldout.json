@@ -1,0 +1,220 @@
+[
+ [
+  "A clock loses 4 minutes every hour. It was set correctly at noon on Monday. At what real time will it next show the correct time, and how many times will the hands overlap in that period? Show the derivation.",
+  [
+   "Now redo it if the clock gains 3 minutes per hour instead."
+  ]
+ ],
+ [
+  "Prove that the sum of the first n odd numbers is n squared in two different ways, then use it to compute 1 + 3 + 5 + ... + 2001.",
+  []
+ ],
+ [
+  "Eight people sit around a round table. Each person is either a knight (always truthful) or a knave (always lies). Each says 'both my neighbours are knaves'. How many knights can there be? Enumerate every possibility.",
+  []
+ ],
+ [
+  "Compute the expected number of coin flips needed to see the sequence HTH for the first time, and compare it to the expected number for HTT. Explain why they differ.",
+  []
+ ],
+ [
+  "A bag has 5 red, 4 blue and 3 green marbles. You draw 4 without replacement. What is the probability that you get at least one of each colour? Give an exact fraction.",
+  [
+   "Sanity-check that with a quick simulation sketch in Python (code only, no need to run it)."
+  ]
+ ],
+ [
+  "Derive the formula for the sum of a geometric series from scratch and then apply it to find the present value of a perpetuity that grows at 2% a year with a 6% discount rate.",
+  []
+ ],
+ [
+  "How many ways are there to tile a 2 x 10 board with 1 x 2 dominoes and 2 x 2 squares? Set up the recurrence and solve it.",
+  []
+ ],
+ [
+  "Explain the Monty Hall problem to a sceptical engineer who insists the odds are 50/50, then generalise to 100 doors where the host opens 98.",
+  []
+ ],
+ [
+  "Implement a token-bucket rate limiter in Rust that is safe to share across threads without a global lock on the hot path. Include unit tests with a fake clock and explain the memory-ordering choices.",
+  []
+ ],
+ [
+  "Write a Python generator that yields all permutations of a multiset in lexicographic order without duplicates, without using itertools. Analyse its time complexity.",
+  []
+ ],
+ [
+  "Write a CUDA kernel for a row-wise softmax over a [rows, 4096] fp16 matrix with fp32 accumulation, using one warp per row. Explain the memory access pattern.",
+  [
+   "How would you change it for 32768 columns?"
+  ]
+ ],
+ [
+  "Write a TypeScript function that deep-merges two JSON-like objects, with arrays concatenated and conflicting scalars resolved by a user supplied callback. Include types and edge cases.",
+  []
+ ],
+ [
+  "Design a SQL schema for a library lending system with members, books, copies, loans and holds, then write queries for: overdue loans per member, the most borrowed titles per month, and members with more than three active holds.",
+  []
+ ],
+ [
+  "Given a Linux server where a Python service periodically freezes for 30 seconds, list a systematic debugging plan with the exact commands you would run and what each result would tell you.",
+  []
+ ],
+ [
+  "Write a Go program that reads a large log file concurrently with a worker pool, counts HTTP status codes per minute, and prints a sorted summary. Discuss back-pressure.",
+  []
+ ],
+ [
+  "Explain how a B-tree insert with node split works, then write a compact Python implementation of a B-tree of order 4 supporting insert and search.",
+  []
+ ],
+ [
+  "Refactor this idea: a function that takes a list of dicts and returns the top-k by a nested key, currently written with three nested loops. Show a clean version and explain heap versus sort trade-offs.",
+  []
+ ],
+ [
+  "Write a bash script that safely rotates a directory of log files, compresses files older than 7 days, deletes those older than 90 days, and never touches a file that is currently open. Explain each safeguard.",
+  []
+ ],
+ [
+  "Produce a JSON schema for an e-commerce order (customer, line items with SKU and quantity, shipping address, payment method, discounts) and then a valid example instance with three line items and one discount.",
+  []
+ ],
+ [
+  "Convert this table to YAML and then to a Markdown table with totals: Item=Pen qty 12 price 1.5; Item=Notebook qty 5 price 3.2; Item=Stapler qty 2 price 7.9; Item=Tape qty 10 price 0.8.",
+  []
+ ],
+ [
+  "Erkläre den Unterschied zwischen dem Genitiv und dem Dativ im Deutschen mit jeweils drei Beispielsätzen und typischen Fehlern, die Lernende machen.",
+  []
+ ],
+ [
+  "Explique en français comment fonctionne le système de retraite par répartition, ses avantages, ses limites démographiques et les réformes envisagées dans les pays européens.",
+  []
+ ],
+ [
+  "Объясни, как работает механизм внимания в трансформерах, простыми словами, с примером на предложении из пяти слов.",
+  [
+   "А теперь объясни, чем многоголовое внимание отличается от одноголового."
+  ]
+ ],
+ [
+  "日本語で、台風が発生する仕組みと、日本の防災対策の主な特徴を、中学生にもわかるように説明してください。",
+  []
+ ],
+ [
+  "请用中文解释什么是区块链的共识机制，比较工作量证明和权益证明的优缺点，并给出一个生活中的类比。",
+  []
+ ],
+ [
+  "Explica en español cómo calcular el interés compuesto y compara un depósito a 5 años con capitalización mensual frente a anual, con números concretos.",
+  []
+ ],
+ [
+  "한국어로 김치가 발효되는 과정과 건강에 미치는 영향을 과학적으로 설명해 주세요.",
+  []
+ ],
+ [
+  "اشرح بالعربية كيف تعمل الألواح الشمسية وما العوامل التي تؤثر في كفاءتها، مع مثال حسابي بسيط.",
+  []
+ ],
+ [
+  "हिंदी में समझाइए कि UPI भुगतान प्रणाली पर्दे के पीछे कैसे काम करती है और लेन-देन की सुरक्षा कैसे सुनिश्चित की जाती है।",
+  []
+ ],
+ [
+  "Spiega in italiano la differenza tra il passato prossimo e l'imperfetto con esempi tratti dalla vita quotidiana e un breve esercizio con soluzioni.",
+  []
+ ],
+ [
+  "Explain how a modern CPU executes an instruction out of order, covering the reorder buffer, register renaming, reservation stations and what happens on a branch misprediction.",
+  []
+ ],
+ [
+  "Describe how public-key TLS 1.3 handshakes establish forward secrecy, step by step, and what an attacker who records the traffic and later steals the server's long-term key can and cannot do.",
+  []
+ ],
+ [
+  "Summarise the causes, course and consequences of the 2008 financial crisis for an intelligent reader with no finance background, in about 600 words.",
+  []
+ ],
+ [
+  "Write a clear explanation of how mRNA vaccines train the immune system, including what happens at the cellular level in the first 48 hours after injection.",
+  []
+ ],
+ [
+  "Compare the Raft and Paxos consensus protocols: leader election, log replication, membership change, and what makes Raft easier to implement correctly.",
+  []
+ ],
+ [
+  "Describe how a refrigerator works, using the vapour-compression cycle, and explain why leaving the door open does not cool a room.",
+  []
+ ],
+ [
+  "Explain the difference between latency and throughput using a highway analogy, and then show how batching in an inference server trades one against the other.",
+  []
+ ],
+ [
+  "Write a careful, balanced explanation of the trolley problem and two serious objections to utilitarian answers to it.",
+  []
+ ],
+ [
+  "Write a 350-word scene in which two retired lighthouse engineers argue politely about whether to automate the last manned light, ending without a clear winner.",
+  []
+ ],
+ [
+  "Write a dialogue between a sceptical customer and a support agent about a billing error on a mobile plan, where the agent stays calm and the customer slowly changes their mind.",
+  [
+   "Rewrite the last four lines so the agent makes a mistake and recovers."
+  ]
+ ],
+ [
+  "Compose a concise cover letter for a junior data engineer applying to a logistics company, emphasising a project that cut a nightly batch job from 6 hours to 40 minutes.",
+  []
+ ],
+ [
+  "Write a limerick about a segmentation fault, then explain in two sentences what actually causes one.",
+  []
+ ],
+ [
+  "Here is an OCR transcript of a receipt: 'GREENFIELD MARKET 142 Oak St. 03/14 18:22. Apples 1.2kg 4.38; Oat milk 2x 5.98; Bread 2.45; Eggs 12 3.99; SUBTOTAL 16.80; TAX 1.34; TOTAL 18.14; VISA ****4821'. Extract the items as JSON, verify that the total adds up, and say what is unusual if anything.",
+  []
+ ],
+ [
+  "A bar chart shows monthly sign-ups for a service: Jan 410, Feb 395, Mar 520, Apr 610, May 585, Jun 790, Jul 760, Aug 640, Sep 700. Describe the trend, name the two largest month-over-month changes, and suggest two hypotheses for the June jump.",
+  []
+ ],
+ [
+  "A screenshot of a mobile app shows a top bar with the title 'Trips', a search field, three cards (Lisbon, Kyoto, Cusco) each with a date range and a price, and a bottom tab bar with Home, Trips, Saved, Profile where Trips is highlighted. Write the accessibility description a screen reader should read, and list five UI issues a reviewer might flag.",
+  []
+ ],
+ [
+  "A photo description: a wooden dock at dawn, mist over a still lake, two red canoes tied side by side, a lone heron on the third post, pine forest on the far shore, faint orange light behind the ridge. Write a 120-word alt text and a one-line caption.",
+  []
+ ],
+ [
+  "A scanned page of a lab notebook reads: 'Run 7: 25 mL buffer pH 7.4, add 2 mL substrate, incubate 37C 15 min, absorbance 0.412 at 340 nm; control 0.058. Run 8: same but pH 6.8, absorbance 0.301'. Interpret the results, compute corrected absorbances and the relative activity of run 8.",
+  []
+ ],
+ [
+  "A floor plan description: a 2-bedroom flat, entrance hall leading to an open kitchen-living room 5.2 m by 3.8 m, bedroom 1 at 3.4 m by 3.0 m on the east, bedroom 2 at 2.8 m by 2.6 m on the north, bathroom 2.0 m by 1.8 m. Compute the total floor area and suggest two layout improvements.",
+  []
+ ],
+ [
+  "A table in a PDF lists quarterly revenue in millions: Q1 12.4, Q2 13.1, Q3 11.8, Q4 15.9 for 2024 and Q1 13.0, Q2 14.2, Q3 12.5, Q4 17.3 for 2025. Compute year-over-year growth per quarter and for the year and comment on seasonality.",
+  []
+ ],
+ [
+  "A video summary request: a 6-frame description of a cooking clip - frame 1 chops onions, frame 2 onions in a hot pan, frame 3 adds minced garlic and tomatoes, frame 4 simmering with a lid, frame 5 stirs in basil, frame 6 plated over pasta. Write the recipe steps with approximate timings.",
+  []
+ ],
+ [
+  "You are given a task: migrate a 400 GB PostgreSQL database to a new major version with under 10 minutes of downtime. Produce a step-by-step plan with rollbacks, validation queries and a communication timeline.",
+  []
+ ],
+ [
+  "Plan a three-day trip to Hanoi for a family with a toddler, including food suggestions that are mild, a day with minimal walking, and weather contingencies. Keep it to a table.",
+  []
+ ]
+]

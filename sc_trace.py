@@ -592,6 +592,15 @@ col_green = "[32;1m"
 
 @torch.inference_mode()
 def main(args):
+    if args.extra_conversations:
+        with open(args.extra_conversations, encoding = "utf8") as f:
+            extra = json.load(f)
+        if args.only_extra:
+            # held-out sets: the built-in seed prompts are what a calibration trace was sampled from
+            CONVERSATIONS[:] = []
+        CONVERSATIONS.extend((e[0], list(e[1])) for e in extra)
+        print(f" -- Added {len(extra)} extra conversations from {args.extra_conversations} ({len(CONVERSATIONS)} total)")
+
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     generator = Generator(
         model = model,
@@ -758,4 +767,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
+    parser.add_argument("--only_extra", action = "store_true", help = "Use only the --extra_conversations file (drop the built-in seed set), e.g. for a held-out trace")
+    parser.add_argument("--extra_conversations", type = str, default = None, help = "JSON file with additional conversations: a list of [seed prompt, [follow-ups]] entries appended to the built-in set")
     main(parser.parse_args())

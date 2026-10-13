@@ -245,4 +245,23 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
     print(f" -- Creating quantization_config.json")
     create_quantization_config_json(out_dir)
 
+    # --retry_outliers: ship the record of every matrix that was re-encoded with another seed (and the settings
+    # that selected them). Only written when the option was used, so a default conversion's output is unchanged
+    if args.get("retry_outliers") and args.get("work_dir"):
+        from . import retry_outliers as ro
+        retry_path = os.path.join(args["work_dir"], "retry_outliers.jsonl")
+        records = ro.read_log(retry_path) if os.path.exists(retry_path) else []
+        with open(os.path.join(out_dir, "exl3_retry_log.json"), "w", encoding = "utf8") as f:
+            f.write(json.dumps({
+                "retry_outliers": {
+                    "ratio": args.get("retry_ratio"),
+                    "min_gscale": args.get("retry_min_gscale"),
+                    "max_seeds": args.get("retry_max_seeds"),
+                    "seed_schedule": f"seed = idx + {ro.SEED_STRIDE} * k, k = 1 .. max_seeds (k = 0: the original idx)",
+                },
+                "summary": ro.summarize(records),
+                "retried": records,
+            }, indent = 4))
+        print(f" -- Wrote exl3_retry_log.json ({len(records)} retried matrices)")
+
     print(f" -- Finished compiling model to {out_dir}")
