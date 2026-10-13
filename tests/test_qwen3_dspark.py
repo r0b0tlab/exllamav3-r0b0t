@@ -14,7 +14,7 @@ from exllamav3.architecture.dflash import DFlashConfig, DFlashModel
 from exllamav3.architecture.qwen3_dspark import Qwen3DSparkConfig, Qwen3DSparkModel
 from exllamav3.modules.arch_specific.dflash import DFlashInputLayer
 from exllamav3.modules.arch_specific.dspark_markov import (
-    DSparkHeads, markov_candidates, markov_confidence, markov_walk,
+    DSparkHeads, adaptive_window, markov_candidates, markov_confidence, markov_walk,
 )
 
 # Same structure as openbmb/MiniCPM-V-4.7-35B-A3B-DSpark at toy widths (every dim stays a multiple of 128 where the
@@ -364,6 +364,9 @@ def _stub_model(vocab = 97, hidden = 16, rank = 8, top_k = 16, threshold = None,
     model = object.__new__(Qwen3DSparkModel)
     model._markov_top_k = top_k
     model.draft_conf_threshold = threshold
+    model.adaptive_verification = False
+    model.verify_cost = [1.0 + 0.1 * n for n in range(16)]
+    model.draft_cost = 0.35
     heads = SimpleNamespace(
         device = torch.device("cpu"),
         w1 = torch.randn(vocab, rank, generator = g).to(torch.bfloat16),
@@ -448,3 +451,40 @@ def test_native_and_torch_walk_agree_when_a_gpu_is_present():
         # fp16 logits may flip a near-tie: demand agreement of nearly everything
         agree = (gpu.cpu() == cpu).float().mean()
         assert agree >= 0.9, (k, float(agree))
+
+
+def test_adaptive_window_trades_expected_tokens_against_cost():
+    flat = [1.0] * 16
+    steep = [1.0 + 0.5 * n for n in range(16)]
+    sure = torch.full((1, 15), 0.99)
+    unsure = torch.full((1, 15), 0.05)
+    # Free rows: verify everything that has any chance, none when nothing is expected to survive
+    assert adaptive_window(sure, flat) == 15
+    assert adaptive_window(unsure, steep) == 0
+    # Expensive rows: confident drafts are worth a few rows, not all of them
+    n = adaptive_window(torch.full((1, 15), 0.7), steep)
+    assert 0 < n < 15
+    # A confident prefix followed by a hopeless tail
+    conf = torch.cat((torch.full((1, 5), 0.95), torch.full((1, 10), 0.02)), dim = 1)
+    assert adaptive_window(conf, steep) == 5
+    # A batch shares the largest window any of its requests asks for
+    both = torch.cat((conf, unsure), dim = 0)
+    assert adaptive_window(both, steep) == 5
+
+
+def test_adaptive_verification_reports_a_confidence_length_and_keeps_the_ids():
+    model, head, heads, state = _stub_model()
+    base = model.sample_from_state(state, {"dspark_anchor_ids": torch.tensor([[3], [8]])})
+    model.adaptive_verification = True
+    model.verify_cost = [1.0 + 0.5 * n for n in range(16)]
+    model.draft_cost = 0.0
+    p = {"dspark_anchor_ids": torch.tensor([[3], [8]])}
+    ids = model.sample_from_state(state, p)
+    assert ids.tolist() == base.tolist()
+    conf = markov_confidence(state, ids[:, :-1], heads.w1, heads.conf_w, heads.conf_b)
+    assert p["draft_confidence_len"] == adaptive_window(conf, model.verify_cost, model.draft_cost)
+    # combined with a threshold the shorter of the two applies
+    model.draft_conf_threshold = 1.0 + 1e-3
+    p = {"dspark_anchor_ids": torch.tensor([[3], [8]])}
+    model.sample_from_state(state, p)
+    assert p["draft_confidence_len"] == 0

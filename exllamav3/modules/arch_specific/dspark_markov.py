@@ -261,3 +261,33 @@ class DSparkHeads(Module):
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None):
         return to2(x, out_dtype, None)
+
+
+def adaptive_window(
+    conf: torch.Tensor,
+    verify_cost: list[float],
+    draft_cost: float = 0.0,
+) -> int:
+    """
+    Number of drafts to verify so that the expected accepted tokens per unit of time is highest.
+
+    The expected tokens of a round that verifies n drafts are 1 + sum_{j <= n} prod_{i <= j} conf_i (the verified
+    token plus the survival probability of each kept draft), its cost is draft_cost + verify_cost[n]. Requests of a
+    batch share one window, the largest any of them asks for (each request still stops at its first mismatch).
+
+    :param conf:
+        (bsz, rows) fp32 confidences of the drafts, in order
+
+    :param verify_cost:
+        cost of verifying 1 .. rows + 1 rows (anchor + n drafts), index n; any unit
+
+    :param draft_cost:
+        cost of producing the drafts, same unit
+    """
+    bsz, rows = conf.shape
+    assert len(verify_cost) >= rows + 1, "verify_cost must cover 1 .. rows + 1 verified rows"
+    survival = torch.cumprod(conf.float(), dim = 1)
+    expected = torch.cat((torch.ones((bsz, 1), device = conf.device), 1.0 + torch.cumsum(survival, dim = 1)), dim = 1)
+    cost = torch.tensor([draft_cost + c for c in verify_cost[:rows + 1]], dtype = torch.float, device = conf.device)
+    best = torch.argmax(expected / cost[None, :], dim = 1)
+    return int(best.max().item())

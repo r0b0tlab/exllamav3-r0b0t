@@ -3,7 +3,7 @@ from typing_extensions import override
 import torch
 
 from ..modules.arch_specific.dspark_markov import (
-    DSparkHeads, markov_candidates, markov_walk, markov_confidence,
+    DSparkHeads, markov_candidates, markov_walk, markov_confidence, adaptive_window,
 )
 from ..util.device_copy import to_device
 from ..util.tensor import get_for_device
@@ -198,6 +198,29 @@ class Qwen3DSparkModel(DFlashModel):
         self._markov_top_k = 64
         # With the confidence head: keep only the leading drafts whose confidence is at least this (None: all)
         self.draft_conf_threshold = None
+        # With the confidence head: verify the number of drafts that maximizes the expected accepted tokens per unit
+        # of time under a cost model of the round (see set_verify_cost)
+        self.adaptive_verification = False
+        self.verify_cost = [1.0 + 0.1 * n for n in range(config.block_size + 1)]
+        self.draft_cost = 0.35
+
+
+    def set_verify_cost(self, verify_cost: list[float], draft_cost: float = 0.0):
+        """
+        Cost model for adaptive_verification, in any one unit (e.g. milliseconds).
+
+        :param verify_cost:
+            Cost of one target verify pass over 1 .. block_size + 1 rows (anchor + n drafts), entry n. The default
+            is a plain decode step of 1 plus 0.1 per extra row, typical for a mixture-of-experts target on a
+            bandwidth-bound device. Measure it for a different target or device.
+
+        :param draft_cost:
+            Cost of producing the drafts and updating the draft's context, same unit.
+        """
+        assert len(verify_cost) >= self.config.block_size + 1, \
+            "verify_cost has one entry per verified row count, 1 .. block_size + 1"
+        self.verify_cost = [float(c) for c in verify_cost]
+        self.draft_cost = float(draft_cost)
 
 
     @property
@@ -277,7 +300,8 @@ class Qwen3DSparkModel(DFlashModel):
         out = markov_walk(unary, cands, anchor, heads.w1, heads.w2)
 
         thr = self.draft_conf_threshold
-        if params.get("export_draft_conf") or thr is not None:
+        adaptive = self.adaptive_verification and heads.has_confidence
+        if params.get("export_draft_conf") or thr is not None or adaptive:
             bsz, rows = out.shape[0], out.shape[1] - 1
             if heads.has_confidence:
                 conf = markov_confidence(to_device(state, dev), out[:, :-1], heads.w1, heads.conf_w, heads.conf_b)
@@ -286,9 +310,15 @@ class Qwen3DSparkModel(DFlashModel):
                 conf = unary[..., 0]
             if params.get("export_draft_conf"):
                 params["draft_conf"] = torch.cat((conf.new_zeros((bsz, 1)), conf), dim = 1)
+            keep = None
             if thr is not None and heads.has_confidence:
                 run = torch.cumprod((conf >= thr).to(torch.int32), dim = 1).sum(dim = 1)
-                params["draft_confidence_len"] = int(run.max().item())
+                keep = int(run.max().item())
+            if adaptive:
+                n = adaptive_window(conf, self.verify_cost, self.draft_cost)
+                keep = n if keep is None else min(keep, n)
+            if keep is not None:
+                params["draft_confidence_len"] = keep
         return out
 
 

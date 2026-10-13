@@ -4,10 +4,17 @@ Speculative decoding checks and measurements for a DSpark draft on a real target
 
 Tasks (--tasks, comma separated):
 
-  bench     Per prompt: plain decode and drafted decode (greedy, one stream), tokens, time, accepted length. Arms are
-            "plain" and "k<K>" (Markov top-K, optionally "k<K>c<thr>": confidence-truncated verification). The token
-            streams of every arm are compared with the plain arm: greedy speculative decoding must reproduce plain
-            decoding, any divergence is listed with the target's own margin at the first differing position.
+  bench     Per prompt: plain decode and drafted decode (greedy, one stream), tokens, time, accepted length. Arms:
+              plain      plain decoding
+              plainc     plain decoding with the prompt prefilled in 64-token chunks (a numerical control)
+              k<K>       drafted, Markov walk over the top-K candidates (K = 64 is the default of the model)
+              k<K>c<t>   ... verifying only the leading drafts whose confidence is at least t
+              k<K>a      ... verifying the number of drafts that maximizes the expected tokens per unit of time
+                         (cost model measured by the profile task at first use)
+            The token streams of every arm are compared with the plain arm: greedy speculative decoding must
+            reproduce plain decoding up to floating point noise, every divergence is listed with the target's own
+            margin at the first differing position.
+  profile   Wall-clock cost of a verify pass over 1 .. 16 rows and of the draft side of a round.
   forced    Drafted decoding where the proposals are replaced by the plain stream with a mismatch forced after
             exactly k tokens, k cycling over 0..15: every partial-window commit (and the full window) is exercised
             by the generator, and the stream must still equal plain decoding.
@@ -69,18 +76,9 @@ def run_job(gen, ids, max_new, sampler = None, stop = STOP, ident = 0, **kw):
     return toks, final, job
 
 
-def get_logits(gen, ids):
-    """Target logits (fp32 [V]) for the token after ids, one plain forward"""
-    job = Job(input_ids = torch.tensor([ids], dtype = torch.long), max_new_tokens = 1, sampler = ArgmaxSampler(),
-              return_logits = True, identifier = 0, stop_conditions = [], decode_special_tokens = True)
-    gen.enqueue(job)
-    logits = None
-    while gen.num_remaining_jobs():
-        for r in gen.iterate():
-            for src in (r, r.get("held") or {}):
-                if "logits" in src:
-                    logits = src["logits"].flatten(0, -2)[0].float().cpu()
-    return logits
+def get_logits(rig, ids):
+    """Target logits (fp32 [V]) for the token after ids: a prefill and one single-row step, as plain decoding does"""
+    return rig.logits(ids)
 
 
 def rounds_of(job, new_tokens):
@@ -135,19 +133,28 @@ def chi_square(counts, probs, min_expected = 5.0):
 
 
 def arm_settings(arm: str):
-    if arm == "plain":
-        return None, None
+    """plain | plainc (plain, prompt prefilled in 64-token chunks: a numerical control) |
+    k<K> (Markov top-K) with optionally c<thr> (confidence threshold) or a (adaptive verification)"""
+    if arm in ("plain", "plainc"):
+        return None, None, False
     assert arm.startswith("k")
-    k, _, c = arm[1:].partition("c")
-    return int(k), (float(c) if c else None)
+    body = arm[1:]
+    if body.endswith("a"):
+        return int(body[:-1]), None, True
+    k, _, c = body.partition("c")
+    return int(k), (float(c) if c else None), False
 
 
-def run_arm(arm, rows, gen_plain, gen_spec, draft, warmup = 2):
-    k, thr = arm_settings(arm)
-    gen = gen_plain if k is None else gen_spec
+def run_arm(arm, rows, models, warmup = 2):
+    k, thr, adaptive = arm_settings(arm)
+    draft = models.draft
+    gen = models.gen_plain if arm == "plain" else models.gen_plain_chunk if arm == "plainc" else models.gen_spec
     if k is not None:
         draft.markov_top_k = k
         draft.draft_conf_threshold = thr
+        draft.adaptive_verification = adaptive
+        if adaptive:
+            ensure_profile(models)
     for r in rows[:warmup]:
         run_job(gen, r["ids"], min(r["max_new"], 96))
     out = []
@@ -162,7 +169,7 @@ def run_arm(arm, rows, gen_plain, gen_spec, draft, warmup = 2):
     return out
 
 
-def margin_report(gen_plain, rows, prompts_by_name, plain, other):
+def margin_report(rig, prompts_by_name, plain, other):
     """First differing position of each diverging prompt with the target's own logit gap between the two tokens"""
     rep = []
     for p, o in zip(plain, other):
@@ -175,7 +182,7 @@ def margin_report(gen_plain, rows, prompts_by_name, plain, other):
                             "len_plain": len(a), "len_arm": len(b)})
             continue
         ids = prompts_by_name[p["name"]] + a[:j]
-        lg = get_logits(gen_plain, ids)
+        lg = get_logits(rig, ids)
         la, lb = float(lg[a[j]]), float(lg[b[j]])
         top2 = torch.topk(lg, 2)
         rep.append({"name": p["name"], "class": p["class"], "first_diff": j, "token_plain": a[j], "token_arm": b[j],
@@ -190,20 +197,24 @@ def task_bench(args, models, rows, result):
     res = {}
     for arm in args.arms.split(","):
         t0 = time.time()
-        r = run_arm(arm, rows, gen_plain, gen_spec, draft)
+        r = run_arm(arm, rows, models)
         res[arm] = r
         s = summarize(r)
         print(f"[bench] arm {arm:10s} {time.time() - t0:6.0f}s  " +
               "  ".join(f"{c}: {v['tok_s']:.1f} tok/s AL {v['AL']:.2f}" for c, v in s.items()), flush = True)
     out = {"summary": {a: summarize(r) for a, r in res.items()}, "divergence": {}}
     plain = res.get("plain")
+    if plain is None and args.reference_tokens:
+        ref = json.load(open(args.reference_tokens))["bench"]["tokens"]["plain"]
+        assert len(ref) == len(rows), "reference token streams do not match the prompt list"
+        plain = [{"name": r_["name"], "class": r_["class"], "tokens": t} for r_, t in zip(rows, ref)]
     if plain:
         for arm, r in res.items():
             if arm == "plain":
                 continue
             same = sum(1 for p, o in zip(plain, r) if p["tokens"] == o["tokens"])
             out["divergence"][arm] = {"identical": same, "of": len(r),
-                                      "diverging": margin_report(gen_plain, rows, by_name, plain, r)}
+                                      "diverging": margin_report(models.rig, by_name, plain, r)}
             print(f"[bench] arm {arm}: {same}/{len(r)} streams identical to plain; diverging: "
                   f"{json.dumps(out['divergence'][arm]['diverging'])}", flush = True)
     if args.keep_tokens:
@@ -219,6 +230,7 @@ def task_forced(args, models, rows, result):
     vocab = target.config.vocab_size
     draft.markov_top_k = 64
     draft.draft_conf_threshold = None
+    draft.adaptive_verification = False
     schedule = list(range(16)) + list(range(15, -1, -1))
     res = []
     orig = draft.sample_from_state
@@ -305,55 +317,76 @@ def compare_snapshots(a, b):
     return out
 
 
-@torch.inference_mode()
-def task_rollback(args, models, rows, result):
-    target, draft, gen_plain = models.target, models.draft, models.gen_plain
-    # Own caches: the generators' page tables must not see these pages change under them
-    cache, dcache = models.cache_rb, models.dcache_rb
-    npages = cache.max_num_tokens // 256
-    assert npages >= 12, "rollback needs a cache of at least 12 pages"
-    # Three independent page ranges: A (window then partial commit), C (exact k + 1 row window), B (one token at a time)
-    bt = {n: torch.arange(i * 4, i * 4 + 4, dtype = torch.int32)[None] for i, n in enumerate("ACB")}
+class Rig:
+    """Direct model-level driving (prefill, windows, draft updates) on private caches, one sequence per page range"""
 
-    def params_for(table, seqlen, state, history = False):
-        sl = torch.tensor([seqlen], dtype = torch.int32)
+    def __init__(self, target, draft, cache, dcache):
+        self.target, self.draft, self.cache, self.dcache = target, draft, cache, dcache
+
+    def params_for(self, table, seqlen, state, history = False):
         p = {
-            "attn_mode": "flash_attn", "block_table": table, "cache": cache, "cache_seqlens": sl,
+            "attn_mode": "flash_attn", "block_table": table, "cache": self.cache,
+            "cache_seqlens": torch.tensor([seqlen], dtype = torch.int32),
             "recurrent_states": [state], "indexed_embeddings": [], "recurrent_history": history,
         }
-        p.update(draft.draft_verifier_params)
+        p.update(self.draft.draft_verifier_params)
         return p
 
-    def draft_update(p, table, seqlen, lengths = None):
-        draft.update_kv_from_target(
-            target_hidden = [t.clone() for t in p["export_states"]], cache = dcache,
+    def draft_update(self, p, table, seqlen, lengths = None):
+        self.draft.update_kv_from_target(
+            target_hidden = [t.clone() for t in p["export_states"]], cache = self.dcache,
             params = {"block_table": table, "cache_seqlens": torch.tensor([seqlen], dtype = torch.int32)},
             lengths = lengths,
         )
 
-    def prefill(ids, table, state):
+    @torch.inference_mode()
+    def prefill(self, ids, table, state):
         pos = 0
         while pos < len(ids):
             chunk = torch.tensor([ids[pos:pos + 256]], dtype = torch.long)
-            p = params_for(table, pos, state)
-            target.prefill(chunk, p)
-            draft_update(p, table, pos)
+            p = self.params_for(table, pos, state)
+            self.target.prefill(chunk, p)
+            self.draft_update(p, table, pos)
             pos += chunk.shape[1]
 
-    def window(ids, table, state, start, n, history):
-        p = params_for(table, start, state, history)
-        target.forward(torch.tensor([ids[start:start + n]], dtype = torch.long), p)
-        return p
+    @torch.inference_mode()
+    def window(self, ids, table, state, start, n, history):
+        p = self.params_for(table, start, state, history)
+        logits = self.target.forward(torch.tensor([ids[start:start + n]], dtype = torch.long), p)
+        return p, logits
 
-    def next_drafts(table, seqlen, anchor):
-        pp = {"attn_mode": "flash_attn", "block_table": table, "cache": dcache,
+    @torch.inference_mode()
+    def next_drafts(self, table, seqlen, anchor):
+        pp = {"attn_mode": "flash_attn", "block_table": table, "cache": self.dcache,
               "cache_seqlens": torch.tensor([seqlen], dtype = torch.int32)}
-        st = draft.forward(torch.tensor([[anchor]], dtype = torch.long), pp)
-        ids = draft.sample_from_state(st, pp)
+        st = self.draft.forward(torch.tensor([[anchor]], dtype = torch.long), pp)
+        ids = self.draft.sample_from_state(st, pp)
         return ids[0].cpu(), st.float().cpu()
+
+    @torch.inference_mode()
+    def logits(self, ids, page0 = 16):
+        table = torch.arange(page0, page0 + 4, dtype = torch.int32)[None]
+        s = self.cache.get_new_state()
+        try:
+            self.prefill(ids[:-1], table, s)
+            _, lg = self.window(ids, table, s, len(ids) - 1, 1, False)
+            return lg[0, -1].float().cpu()
+        finally:
+            s.free()
+
+
+@torch.inference_mode()
+def task_rollback(args, models, rows, result):
+    target, draft, gen_plain, rig = models.target, models.draft, models.gen_plain, models.rig
+    cache, dcache = rig.cache, rig.dcache
+    vocab = target.config.vocab_size
+    # Independent page ranges: A (16 rows, commit anchor + keep drafts), J (the same with different tokens after the
+    # kept ones), D (exactly keep + 1 rows), B (one token at a time)
+    bt = {n: torch.arange(i * 4, i * 4 + 4, dtype = torch.int32)[None] for i, n in enumerate("AJDB")}
 
     draft.markov_top_k = 64
     draft.draft_conf_threshold = None
+    draft.adaptive_verification = False
     # a long text sequence: a prompt followed by its own plain continuation (the longest of the first few)
     seq = []
     for r in rows[:4]:
@@ -364,57 +397,127 @@ def task_rollback(args, models, rows, result):
     # committed lengths: a short one, and one whose window straddles a page boundary of the paged cache
     lens = []
     for L in (int(x) for x in args.rollback_lengths.split(",")):
-        L = min(L, len(seq) - 17, 12 * 256 - 40)
+        L = min(L, len(seq) - 17, 4 * 256 - 40)
         if L > 0 and L not in lens:
             lens.append(L)
     print(f"[rollback] sequence of {len(seq)} tokens, committed lengths {lens}", flush = True)
     for L in lens:
         for keep in range(16):
-            sA, sC, sB = (cache.get_new_state() for _ in range(3))
+            states = {n: cache.get_new_state() for n in "AJDB"}
             try:
-                # A: 16-row window, then commit anchor + keep drafts
-                prefill(seq[:L], bt["A"], sA)
-                pA = window(seq, bt["A"], sA, L, 16, True)
-                if keep < 15:
-                    sA.rewind(15 - keep)
-                else:
-                    sA.rewind(0)
-                draft_update(pA, bt["A"], L, lengths = [keep + 1])
-                # C: a window of exactly keep + 1 rows, nothing to roll back
-                prefill(seq[:L], bt["C"], sC)
-                pC = window(seq, bt["C"], sC, L, keep + 1, True)
-                draft_update(pC, bt["C"], L)
+                sA, sJ, sD, sB = (states[n] for n in "AJDB")
+                # A: 16-row window, then commit anchor + keep drafts (the generator's rejection path)
+                rig.prefill(seq[:L], bt["A"], sA)
+                pA, _ = rig.window(seq, bt["A"], sA, L, 16, True)
+                sA.rewind(15 - keep)
+                rig.draft_update(pA, bt["A"], L, lengths = [keep + 1])
+                # J: the drafts after the kept ones replaced by other tokens: the committed state must not notice
+                junk = seq[:L + 1 + keep] + [(t + 7919 + i) % vocab for i, t in enumerate(seq[L + 1 + keep:L + 16])]
+                rig.prefill(seq[:L], bt["J"], sJ)
+                pJ, _ = rig.window(junk, bt["J"], sJ, L, 16, True)
+                sJ.rewind(15 - keep)
+                rig.draft_update(pJ, bt["J"], L, lengths = [keep + 1])
+                # D: a window of exactly keep + 1 rows (normalized as a fully accepted window)
+                rig.prefill(seq[:L], bt["D"], sD)
+                pD, _ = rig.window(seq, bt["D"], sD, L, keep + 1, True)
+                sD.rewind(0)
+                rig.draft_update(pD, bt["D"], L)
                 # B: the same tokens one at a time
-                prefill(seq[:L], bt["B"], sB)
+                rig.prefill(seq[:L], bt["B"], sB)
                 for j in range(keep + 1):
-                    pB = window(seq, bt["B"], sB, L + j, 1, False)
-                    draft_update(pB, bt["B"], L + j)
+                    pB, _ = rig.window(seq, bt["B"], sB, L + j, 1, False)
+                    rig.draft_update(pB, bt["B"], L + j)
                 n = L + keep + 1
-                assert sA.position == sC.position == sB.position == n, (sA.position, sC.position, sB.position, n)
-                snaps = {k: snapshot(cache, dcache, s, bt[k], n) for k, s in (("A", sA), ("C", sC), ("B", sB))}
-                ids_A, st_A = next_drafts(bt["A"], n, seq[n])
-                ids_C, st_C = next_drafts(bt["C"], n, seq[n])
-                ids_B, st_B = next_drafts(bt["B"], n, seq[n])
+                assert sA.position == sJ.position == sD.position == sB.position == n, \
+                    (sA.position, sJ.position, sD.position, sB.position, n)
+                snaps = {k: snapshot(cache, dcache, states[k], bt[k], n) for k in "AJDB"}
+                nd = {k: rig.next_drafts(bt[k], n, seq[n]) for k in "AJDB"}
                 entry = {
                     "L": L, "keep": keep,
-                    "A_vs_C": compare_snapshots(snaps["A"], snaps["C"]),
+                    "A_vs_J": compare_snapshots(snaps["A"], snaps["J"]),
+                    "A_vs_D": compare_snapshots(snaps["A"], snaps["D"]),
                     "A_vs_B": compare_snapshots(snaps["A"], snaps["B"]),
-                    "C_vs_B": compare_snapshots(snaps["C"], snaps["B"]),
-                    "next_draft_state_rel_l2_A_vs_B": _rel(st_A, st_B)[0],
-                    "next_drafts_equal_A_vs_B": int((ids_A == ids_B).sum()), "next_drafts_equal_A_vs_C": int((ids_A == ids_C).sum()),
+                    "D_vs_B": compare_snapshots(snaps["D"], snaps["B"]),
+                    "next_draft_state_rel_l2_A_vs_J": _rel(nd["A"][1], nd["J"][1])[0],
+                    "next_draft_state_rel_l2_A_vs_B": _rel(nd["A"][1], nd["B"][1])[0],
+                    "next_drafts_equal_A_J": int((nd["A"][0] == nd["J"][0]).sum()),
+                    "next_drafts_equal_A_B": int((nd["A"][0] == nd["B"][0]).sum()),
                 }
                 res.append(entry)
-                print(f"[rollback] L={L} keep={keep:2d}  A~C  conv {entry['A_vs_C']['gdn_conv']['rel_l2']:.1e} "
-                      f"state {entry['A_vs_C']['gdn_state']['rel_l2']:.1e} kv {entry['A_vs_C']['kv']['rel_l2']:.1e} "
-                      f"dkv {entry['A_vs_C']['dkv']['rel_l2']:.1e} | A~B conv {entry['A_vs_B']['gdn_conv']['rel_l2']:.1e} "
-                      f"state {entry['A_vs_B']['gdn_state']['rel_l2']:.1e} kv {entry['A_vs_B']['kv']['rel_l2']:.1e} "
-                      f"dkv {entry['A_vs_B']['dkv']['rel_l2']:.1e} | C~B state {entry['C_vs_B']['gdn_state']['rel_l2']:.1e} "
-                      f"| drafts A=B {entry['next_drafts_equal_A_vs_B']}/16 A=C {entry['next_drafts_equal_A_vs_C']}/16",
-                      flush = True)
+
+                def f(c, comp):
+                    return f"{entry[c][comp]['rel_l2']:.1e}"
+                print(f"[rollback] L={L} keep={keep:2d} | A~J conv {f('A_vs_J', 'gdn_conv')} state {f('A_vs_J', 'gdn_state')} "
+                      f"kv {f('A_vs_J', 'kv')} dkv {f('A_vs_J', 'dkv')} drafts {entry['next_drafts_equal_A_J']}/16 | "
+                      f"A~B conv {f('A_vs_B', 'gdn_conv')} state {f('A_vs_B', 'gdn_state')} kv {f('A_vs_B', 'kv')} "
+                      f"dkv {f('A_vs_B', 'dkv')} drafts {entry['next_drafts_equal_A_B']}/16 | "
+                      f"A~D state {f('A_vs_D', 'gdn_state')} D~B state {f('D_vs_B', 'gdn_state')}", flush = True)
             finally:
-                for s in (sA, sC, sB):
+                for s in states.values():
                     s.free()
     result["rollback"] = res
+    comps = ("gdn_conv", "gdn_state", "kv", "dkv")
+    result["rollback_summary"] = {
+        k: {c: max(e[k][c]["rel_l2"] for e in res) for c in comps}
+        for k in ("A_vs_J", "A_vs_B", "A_vs_D", "D_vs_B")
+    }
+    print("[rollback] summary (worst rel_l2 over all cases)", json.dumps(result["rollback_summary"]), flush = True)
+
+
+# ----------------------------------------------------------------------------------------------------------- profile
+
+
+@torch.inference_mode()
+def ensure_profile(models, context = 300, reps = 7):
+    """Cost of one verify pass over 1 .. 16 rows and of the draft side of a round (milliseconds, wall clock, one
+    stream at `context` committed tokens); installed as the model's cost model for adaptive verification"""
+    if getattr(models, "profile", None) is not None:
+        return models.profile
+    rig, draft = models.rig, models.draft
+    ids = models.profile_ids
+    assert len(ids) >= context + 17
+    table = torch.arange(16, 20, dtype = torch.int32)[None]
+    state = rig.cache.get_new_state()
+    verify = []
+    try:
+        rig.prefill(ids[:context], table, state)
+        p = None
+        for n in range(1, 17):
+            ts = []
+            for rep in range(reps + 2):
+                state.position = context
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                p, _ = rig.window(ids, table, state, context, n, True)
+                torch.cuda.synchronize()
+                ts.append(time.perf_counter() - t0)
+            ts = sorted(ts[2:])
+            verify.append(1000 * ts[len(ts) // 2])
+        state.position = context
+        ts, tu = [], []
+        for rep in range(reps + 2):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            rig.next_drafts(table, context, ids[context])
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            rig.draft_update(p, table, context, lengths = [16])
+            torch.cuda.synchronize()
+            ts.append(t1 - t0)
+            tu.append(time.perf_counter() - t1)
+        ts, tu = sorted(ts[2:]), sorted(tu[2:])
+        draft_ms, update_ms = 1000 * ts[len(ts) // 2], 1000 * tu[len(tu) // 2]
+    finally:
+        state.free()
+    draft.set_verify_cost(verify, draft_ms + update_ms)
+    models.profile = {"context": context, "verify_ms": verify, "draft_ms": draft_ms, "draft_kv_update_ms": update_ms}
+    print(f"[profile] verify ms by rows 1..16: {[round(v, 1) for v in verify]}; draft {draft_ms:.1f} ms, "
+          f"draft K/V update {update_ms:.1f} ms", flush = True)
+    return models.profile
+
+
+def task_profile(args, models, rows, result):
+    result["profile"] = ensure_profile(models)
 
 
 # ----------------------------------------------------------------------------------------------------------- sampled
@@ -424,13 +527,24 @@ def task_sampled(args, models, rows, result):
     target, draft, gen_plain, gen_spec = models.target, models.draft, models.gen_plain, models.gen_spec
     draft.markov_top_k = 64
     draft.draft_conf_threshold = None
-    T = args.temperature
+    draft.adaptive_verification = False
     out = []
     for name in args.sampled_prompts.split(","):
         r = next(x for x in rows if x["name"] == name)
         ids = r["ids"]
-        p0 = torch.softmax(get_logits(gen_plain, ids) / T, dim = -1)
         n = args.samples
+        # A test needs distributions with several well populated cells: raise the temperature from the requested one
+        # until the first token and the token after the most likely first token both have >= 12 cells expecting >= 5
+        lg0 = get_logits(models.rig, ids)
+        lg1 = get_logits(models.rig, ids + [int(lg0.argmax())])
+        T = None
+        for t_try in [args.temperature] + [t for t in (1.5, 2.0, 3.0, 4.0) if t > args.temperature]:
+            c0 = (torch.softmax(lg0 / t_try, -1) * n >= 5).sum()
+            c1 = (torch.softmax(lg1 / t_try, -1) * n * float(torch.softmax(lg0 / t_try, -1).max()) >= 5).sum()
+            T = t_try
+            if c0 >= 12 and c1 >= 12:
+                break
+        p0 = torch.softmax(lg0 / T, dim = -1)
         counts1 = torch.zeros(p0.shape[-1], dtype = torch.long)
         firsts, seconds = [], []
         t0 = time.time()
@@ -464,7 +578,7 @@ def task_sampled(args, models, rows, result):
             sec = [b for a, b in samples if a == c]
             if len(sec) < 50:
                 continue
-            p1 = torch.softmax(get_logits(gen_plain, ids + [c]) / T, dim = -1)
+            p1 = torch.softmax(get_logits(models.rig, ids + [c]) / T, dim = -1)
             cnt = torch.zeros_like(counts1)
             for b in sec:
                 cnt[b] += 1
@@ -494,10 +608,12 @@ def main():
     ap.add_argument("--batch", type = int, default = 4)
     ap.add_argument("--forced-prompts", type = int, default = 3)
     ap.add_argument("--rollback-lengths", default = "40,246")
-    ap.add_argument("--sampled-prompts", default = "gsm8k-000")
-    ap.add_argument("--samples", type = int, default = 3000)
+    ap.add_argument("--sampled-prompts", default = "gsm8k-003,ifeval-004")
+    ap.add_argument("--samples", type = int, default = 2000)
     ap.add_argument("--temperature", type = float, default = 1.0)
     ap.add_argument("--keep-tokens", action = "store_true")
+    ap.add_argument("--reference-tokens", default = None, help = "result JSON of an earlier run with --keep-tokens: its plain "
+                    "arm is the stream the arms are compared with when this run has no plain arm")
     ap.add_argument("--out", default = None)
     args = ap.parse_args()
     device = torch.device(args.device)
@@ -525,25 +641,42 @@ def main():
     cache_plain = Cache(target, max_num_tokens = args.cache_tokens, max_batch_size = args.batch)
     cache_spec = Cache(target, max_num_tokens = args.cache_tokens, max_batch_size = args.batch, max_history = 15)
     dcache_spec = Cache(draft, max_num_tokens = args.cache_tokens)
-    cache_rb = Cache(target, max_num_tokens = 12 * 256, max_batch_size = 3, max_history = 15)
-    dcache_rb = Cache(draft, max_num_tokens = 12 * 256)
+    cache_rb = Cache(target, max_num_tokens = 20 * 256, max_batch_size = 5, max_history = 15)
+    dcache_rb = Cache(draft, max_num_tokens = 20 * 256)
     target.load(device, progressbar = False)
     draft.load(device, progressbar = False)
     tok = Tokenizer.from_config(tcfg)
     print(f"loaded in {time.time() - t0:.0f}s", flush = True)
 
     gen_plain = Generator(model = target, cache = cache_plain, tokenizer = tok, max_batch_size = args.batch)
+    gen_plain_chunk = None
+    if "plainc" in args.arms:
+        # numerical control: the same plain decoding with the prompt prefilled in different chunks
+        cache_ctl = Cache(target, max_num_tokens = args.cache_tokens, max_batch_size = args.batch)
+        gen_plain_chunk = Generator(model = target, cache = cache_ctl, tokenizer = tok, max_batch_size = args.batch,
+                                    max_chunk_size = 64)
     gen_spec = Generator(model = target, cache = cache_spec, tokenizer = tok, max_batch_size = args.batch,
                          draft_model = draft, draft_cache = dcache_spec, num_draft_tokens = 15, record_draft_stats = True)
+    profile_ids = []
+    for r in json.load(open(args.prompts))["rows"]:
+        profile_ids += r["ids"]
     models = SimpleNamespace(target = target, draft = draft, tok = tok, gen_plain = gen_plain, gen_spec = gen_spec,
-                             cache_rb = cache_rb, dcache_rb = dcache_rb)
+                             gen_plain_chunk = gen_plain_chunk, profile = None, profile_ids = profile_ids[:600],
+                             rig = Rig(target, draft, cache_rb, dcache_rb))
 
     result = {"target": os.path.basename(os.path.normpath(args.target)), "draft": os.path.basename(os.path.normpath(args.draft)),
               "prompts": len(rows), "cache_tokens": args.cache_tokens}
-    tasks = {"bench": task_bench, "forced": task_forced, "rollback": task_rollback, "sampled": task_sampled}
+    tasks = {"bench": task_bench, "forced": task_forced, "rollback": task_rollback, "sampled": task_sampled,
+             "profile": task_profile}
     for t in args.tasks.split(","):
         t1 = time.time()
-        tasks[t](args, models, rows, result)
+        try:
+            tasks[t](args, models, rows, result)
+        except Exception as e:
+            # one failing task must not cost the lock-holding time of the others
+            import traceback
+            traceback.print_exc()
+            result[f"{t}_error"] = repr(e)
         print(f"[{t}] done in {time.time() - t1:.0f}s", flush = True)
         if args.out:
             json.dump(result, open(args.out, "w"), indent = 1)
