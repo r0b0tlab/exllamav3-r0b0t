@@ -94,6 +94,8 @@ class Qwen3DSparkModel(DFlashModel):
         self.modules += [self.markov_w1, self.markov_w2]
 
         self.confidence_head = None
+        self._sts_temps = None     # STS per-position exponents, loaded from EXL3_DSPARK_STS
+        self._sts_sps = None       # verify-batch -> round-ms table, loaded from EXL3_DSPARK_SPS
         if config.enable_confidence_head:
             in_dim = config.hidden_size + (r if config.confidence_head_with_markov else 0)
             # fp32 weights, never quantized (out_features == 1 anyway)
@@ -201,10 +203,31 @@ class Qwen3DSparkModel(DFlashModel):
         if conf_vals is not None:
             conf = torch.stack(conf_vals, dim = -1)              # (bsz, block + 1), col 0 = anchor
             params["draft_confidence"] = conf
-            # Truncation is opt-in: a miscalibrated sigmoid would otherwise gate drafting.
-            # EXL3_DSPARK_CONF_LEN=1 caps the window at the first position below 0.5.
-            import os as _os
-            if _os.environ.get("EXL3_DSPARK_CONF_LEN", "0") != "0":
+            params["draft_conf"] = conf     # key read by the generator's DraftConfidenceCalibrator
+            import os as _os, json as _json
+            _sink = _os.environ.get("EXL3_DSPARK_CONF_DUMP")
+            if _sink:
+                with open(_sink, "a") as _f:
+                    _f.write(_json.dumps(conf[0].tolist()) + "\n")
+
+            # Theta-scheduled verification length (DSpark arXiv:2607.05147 Alg. 1, single
+            # request): STS-calibrated prefix survival a_j = prod_i c_i^T_i, admit l while
+            # Theta_l = (1 + sum_j<=l a_j) / T_round(l+1) increases; stop at the first
+            # decline. Early stopping keeps the scheduler non-anticipating => lossless
+            # (paper Appendix A). Opt-in via EXL3_DSPARK_STS=<temps.json> (+EXL3_DSPARK_SPS=
+            # <sps.json> mapping verify-batch size -> round ms); l = 0 means skip drafting.
+            _sts = _os.environ.get("EXL3_DSPARK_STS")
+            if _sts:
+                if self._sts_temps is None:
+                    self._sts_temps = _json.load(open(_sts))
+                    _sps_path = _os.environ.get("EXL3_DSPARK_SPS")
+                    assert _sps_path, "EXL3_DSPARK_STS requires EXL3_DSPARK_SPS=<json>"
+                    self._sts_sps = {int(k): float(v) for k, v in _json.load(open(_sps_path)).items()}
+                params["draft_confidence_len"] = self._theta_window(conf)
+
+            # Fallback heuristic, unchanged: EXL3_DSPARK_CONF_LEN=1 caps the window at the
+            # first position below 0.5.
+            elif _os.environ.get("EXL3_DSPARK_CONF_LEN", "0") != "0":
                 below = conf < 0.5
                 below[:, 0] = False                               # anchor position never gates
                 first_bad = torch.argmax(below.to(torch.int8), dim = -1)
@@ -213,3 +236,45 @@ class Qwen3DSparkModel(DFlashModel):
                 params["draft_confidence_len"] = int(conf_len.max().item())
 
         return out_ids
+
+    def _theta_window(self, conf: torch.Tensor) -> int:
+        """Admission count l maximizing expected tokens/second, batch row 0 (bsz=1 eval).
+
+        Global argmax over l in [0, block] rather than the paper's early-stopping greedy:
+        this engine's round-time curve is non-unimodal (a ~17 ms fixed per-round floor for
+        the draft machinery makes Theta dip at l=1..3 and recover by l=8..14), so an early
+        stop at the first decline would always return l = 0 (DSpark paper Sec 5.2 notes
+        non-smooth SPS curves need engineering adaptations). Output-equivalence: with
+        greedy verification the accepted prefix is a deterministic match, so the window
+        choice cannot alter decoded text; for sampled decoding revert to early stopping.
+        """
+        import torch as _t
+        sps = self._sts_sps
+        temps = self._sts_temps
+        assert sps and temps, "_theta_window called before STS tables loaded"
+        keys = sorted(sps)
+
+        def t_round(b: int) -> float:
+            if b <= keys[0]: return sps[keys[0]]
+            if b >= keys[-1]: return sps[keys[-1]]
+            lo = max(k for k in keys if k <= b)
+            hi = min(k for k in keys if k >= b)
+            if lo == hi: return sps[lo]
+            w = (b - lo) / (hi - lo)
+            return sps[lo] * (1 - w) + sps[hi] * w
+
+        import math as _math
+        block = conf.shape[-1] - 1
+        best_l, best_theta = 0, 1.0 / t_round(1)     # l = 0: plain decode step
+        a, sum_a = 1.0, 0.0
+        conf_row = conf[0].tolist()                  # single device sync for the whole loop
+        for k in range(1, block + 1):
+            c = min(max(conf_row[k], 1e-6), 1.0 - 1e-6)
+            lg = _math.log(c / (1.0 - c))
+            p = 1.0 / (1.0 + _math.exp(-lg / temps[k]))   # STS-calibrated conditional
+            a *= p
+            sum_a += a
+            theta = (1.0 + sum_a) / t_round(k + 1)
+            if theta > best_theta:
+                best_theta, best_l = theta, k
+        return best_l
