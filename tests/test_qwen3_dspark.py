@@ -209,6 +209,8 @@ def test_model_carries_the_heads_after_the_final_norm_and_defaults():
         assert model.input_layer.target_state_size == HIDDEN * len(TAPS)
         # the heads account for their raw tensors in the weight budget
         assert model.modules[-1].weights_numel() == 2 * VOCAB * RANK + (HIDDEN + RANK) + 1
+        # and are read eagerly: load() derives fp32 / contiguous copies, deferred reads would leave them zero
+        assert model.modules[-1].can_defer_load() is False
     finally:
         d.cleanup()
 

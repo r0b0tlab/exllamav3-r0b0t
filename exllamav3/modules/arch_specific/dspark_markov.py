@@ -208,6 +208,11 @@ class DSparkHeads(Module):
         return self.conf_w is not None
 
     @override
+    def can_defer_load(self):
+        # load() derives tensors (dtype/layout normalization) from what it reads: the data has to be there
+        return False
+
+    @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc

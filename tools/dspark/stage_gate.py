@@ -185,7 +185,7 @@ def main():
         from safetensors import safe_open
         idx = json.load(open(os.path.join(args.bf16_head, "model.safetensors.index.json")))["weight_map"]
         with safe_open(os.path.join(args.bf16_head, idx["lm_head.weight"]), framework = "pt", device = "cpu") as f:
-            head_bf16 = f.get_tensor("lm_head.weight").to(device)
+            head_bf16 = f.get_tensor("lm_head.weight").to(device).float()
 
     k_list = (16, 32, 64)
     report = {"draft": os.path.basename(os.path.normpath(args.draft)), "anchors": [], "pass": True}
@@ -205,7 +205,7 @@ def main():
         lg = fork["base_logits_fork"]
         rows += stage_table({"base_logits": lg}, ref, floors, P, ["base_logits"])
         if head_bf16 is not None:
-            hb = torch.nn.functional.linear(fork["_final"].half()[0], head_bf16).float().cpu()
+            hb = torch.nn.functional.linear(fork["_final"][0].float(), head_bf16).float().cpu()
             r = stage_table({"base_logits_bf16head": hb}, {"base_logits_bf16head": ref["base_logits"]},
                             {n: {"base_logits_bf16head": f["base_logits"]} for n, f in floors.items() if "base_logits" in f},
                             P, ["base_logits_bf16head"])
@@ -274,6 +274,32 @@ def main():
         for e in e2e:
             print(f"  picks e2e   K={e['K']:3d}: tokens equal {e['tokens_equal']}/{e['of']} (leading {e['leading_equal']}), "
                   f"conf max_abs {e['conf_max_abs_vs_ref']:.3e}")
+
+    # Cost of the draft head per round (milliseconds, 15 rows, one stream)
+    if fork:
+        torch.cuda.synchronize(device)
+        lg_t = fork["_logits_dev"]
+        timing = {}
+        for K in k_list:
+            for _ in range(3):
+                markov_candidates(lg_t, lg_t.shape[-1], K)
+            torch.cuda.synchronize(device)
+            t0 = torch.cuda.Event(enable_timing = True)
+            t1 = torch.cuda.Event(enable_timing = True)
+            t0.record()
+            for _ in range(20):
+                u, c = markov_candidates(lg_t, lg_t.shape[-1], K)
+            t1.record()
+            torch.cuda.synchronize(device)
+            tk = t0.elapsed_time(t1) / 20
+            t0.record()
+            for _ in range(20):
+                markov_walk(u, c, fork["_anchor"], draft.heads.w1, draft.heads.w2)
+            t1.record()
+            torch.cuda.synchronize(device)
+            timing[K] = {"candidates_ms": tk, "walk_ms": t0.elapsed_time(t1) / 20}
+        report["timing_ms"] = timing
+        print("timing (ms, 15 rows):", json.dumps(timing))
 
     print("GATE", "PASS" if report["pass"] else "FAIL")
     if args.out:
