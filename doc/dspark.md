@@ -104,10 +104,22 @@ reference engine's (gsm8k 8.36, code 11.29, chat 2.04) to within 4%. The speedup
   the draft: the single-row decode path and the multi-row paths of this target disagree on the logits by a relative L2
   of about 3e-2 (heavy tailed: mixture-of-experts routing flips), and multi-row windows of different lengths disagree
   with each other by the same amount (windows of 9 to 16 rows are bit-identical to one another), so any verify window
-  flips the near ties that single-row decoding resolves the other way. Rewinding is exact: a 16-row window committed after k drafts leaves a recurrent state, K/V and draft K/V that are
-  bit-identical to the ones of a window whose rejected tail was different (all k, windows of 16, 8, 5 and 2 rows).
+  flips the near ties that single-row decoding resolves the other way. Rewinding is exact: a 16-row window committed
+  after k drafts leaves a recurrent state, K/V and draft K/V that are bit-identical to the ones of a window whose
+  rejected tail was different (all k, windows of 16, 8, 5 and 2 rows). Against the same tokens run one at a time the
+  committed state differs by a relative L2 of up to 3e-2, the same size as the kernel difference above.
 - **Truncated windows** use more kernel shapes and so flip a few more ties (23 and 24 of 80 streams for the adaptive
   and the threshold runs, with gaps up to 2 nats at the rarely hit positions).
+- **Sampled decoding** is exact by construction (the sample at every verified row is the target's own, the draft
+  only decides which rows are looked at). Tests: on a small synthetic target through the real generator
+  (`tools/dspark/synthetic_check.py`, 60 000 samples per arm) the first token and the second token given each of the
+  three most frequent first tokens follow the target's distributions, both with the DSpark draft's own proposals
+  (random weights: every round is rejected) and with proposals replaced by the target's greedy continuation (71% of
+  first drafts accepted, partial and full acceptance), p = 0.02 to 0.92 over the seven tests. On the real target, at a
+  context with a spread distribution (temperature 2, 5000 samples, one stream): first token chi-square 15.0 on 21
+  degrees of freedom (p = 0.82) against the verify pass's own row 0, which was checked to be bit-identical to the
+  generator's; plain decoding on the same context 28.8 on 21 (p = 0.12). Smaller runs of 2000 samples gave first-token
+  p between 0.003 and 0.58 without a pattern at the larger size: nothing resolvable, below a KL of about 1e-3 nats.
 
 ## Limitations
 
