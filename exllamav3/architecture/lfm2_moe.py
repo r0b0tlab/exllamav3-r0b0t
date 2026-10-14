@@ -78,7 +78,11 @@ class Lfm2MoeConfig(Config):
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", None)
+        if self.tie_word_embeddings is None:
+            # LFM2 checkpoints tie the head but omit the config flag; a missing lm_head
+            # tensor is the authoritative signal
+            self.tie_word_embeddings = not self.stc.has_tensor("lm_head")
         self.layer_types = read_lfm2_moe_layer_types(self, self.num_hidden_layers)
 
         # RoPE
