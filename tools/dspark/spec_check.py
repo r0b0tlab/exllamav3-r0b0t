@@ -6,7 +6,6 @@ Tasks (--tasks, comma separated):
 
   bench     Per prompt: plain decode and drafted decode (greedy, one stream), tokens, time, accepted length. Arms:
               plain      plain decoding
-              plainc     plain decoding with the prompt prefilled in 64-token chunks (a numerical control)
               k<K>       drafted, Markov walk over the top-K candidates (K = 64 is the default of the model)
               k<K>c<t>   ... verifying only the leading drafts whose confidence is at least t
               k<K>a      ... verifying the number of drafts that maximizes the expected tokens per unit of time
@@ -64,7 +63,10 @@ def run_job(gen, ids, max_new, sampler = None, stop = STOP, ident = 0, **kw):
     )
     gen.enqueue(job)
     toks, final = [], None
+    t_limit = time.time() + 600
     while gen.num_remaining_jobs():
+        if time.time() > t_limit:
+            raise RuntimeError("generation did not finish within 600 s")
         for r in gen.iterate():
             if r.get("identifier") != ident:
                 continue
@@ -108,14 +110,15 @@ def summarize(rows):
 
 def chi_square(counts, probs, min_expected = 5.0):
     """Pearson chi-square of observed counts against probabilities; cells with a small expectation are pooled.
-    Returns (statistic, dof, p_value (Wilson-Hilferty), KL(emp || p) in nats, expected KL under the null)"""
+    Returns (statistic, dof, p_value (Wilson-Hilferty), KL(emp || p) over the pooled cells in nats, its expected value
+    under the null (dof / 2n))"""
     n = float(counts.sum())
-    exp = probs * n
+    exp = probs.double() * n
     order = torch.argsort(exp, descending = True)
     big = order[exp[order] >= min_expected]
     small = order[exp[order] < min_expected]
     o = counts[big].double().tolist()
-    e = exp[big].double().tolist()
+    e = exp[big].tolist()
     if len(small):
         o.append(float(counts[small].sum()))
         e.append(float(exp[small].sum()))
@@ -123,9 +126,7 @@ def chi_square(counts, probs, min_expected = 5.0):
     dof = max(1, len(o) - 1)
     z = ((stat / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
     pval = 0.5 * math.erfc(z / math.sqrt(2))
-    emp = counts.double() / n
-    nz = emp > 0
-    kl = float((emp[nz] * (emp[nz] / probs.double()[nz].clamp_min(1e-300)).log()).sum())
+    kl = sum((a / n) * math.log((a / n) / (b / n)) for a, b in zip(o, e) if a > 0 and b > 0)
     return stat, dof, pval, kl, dof / (2 * n)
 
 
@@ -133,9 +134,9 @@ def chi_square(counts, probs, min_expected = 5.0):
 
 
 def arm_settings(arm: str):
-    """plain | plainc (plain, prompt prefilled in 64-token chunks: a numerical control) |
+    """plain |
     k<K> (Markov top-K) with optionally c<thr> (confidence threshold) or a (adaptive verification)"""
-    if arm in ("plain", "plainc"):
+    if arm == "plain":
         return None, None, False
     assert arm.startswith("k")
     body = arm[1:]
@@ -148,7 +149,7 @@ def arm_settings(arm: str):
 def run_arm(arm, rows, models, warmup = 2):
     k, thr, adaptive = arm_settings(arm)
     draft = models.draft
-    gen = models.gen_plain if arm == "plain" else models.gen_plain_chunk if arm == "plainc" else models.gen_spec
+    gen = models.gen_plain if arm == "plain" else models.gen_spec
     if k is not None:
         draft.markov_top_k = k
         draft.draft_conf_threshold = thr
@@ -235,13 +236,14 @@ def task_bench(args, models, rows, result):
 # ----------------------------------------------------------------------------------------------------------- forced
 
 
-def task_forced(args, models, rows, result):
+def _forced_run(args, models, rows, result, key, schedule):
+    """Drafted decoding on the plain stream's own tokens, each round forced to a (keep, window) from the schedule:
+    window drafts are verified and exactly min(keep, window) of them match. The stream must equal plain decoding."""
     target, draft, gen_plain, gen_spec = models.target, models.draft, models.gen_plain, models.gen_spec
     vocab = target.config.vocab_size
     draft.markov_top_k = 64
     draft.draft_conf_threshold = None
     draft.adaptive_verification = False
-    schedule = list(range(16)) + list(range(15, -1, -1))
     res = []
     orig = draft.sample_from_state
     for r in rows[::13][:args.forced_prompts]:
@@ -252,9 +254,11 @@ def task_forced(args, models, rows, result):
         def forced(state, params, st = st, truth = truth):
             out = orig(state, params)
             P = int(params["cache_seqlens"][0])
-            k = schedule[st["round"] % len(schedule)]
+            k, w = schedule[st["round"] % len(schedule)]
             st["round"] += 1
-            st["k"].append(k)
+            st["k"].append(min(k, w))
+            if w < 15:
+                params["draft_confidence_len"] = w
             ids = [int(out[0, 0])]
             for j in range(15):
                 pos = P + 1 + j
@@ -272,14 +276,31 @@ def task_forced(args, models, rows, result):
         acc = [a for _, _, a in job.draft_stats]
         want = st["k"][:len(acc)]
         # the last round may be cut short by the token limit or EOS
-        ok_acc = all(a == w for a, w in zip(acc[:-1], want[:-1]))
+        ok_acc = all(a == w_ for a, w_ in zip(acc[:-1], want[:-1]))
         res.append({"name": r["name"], "tokens_identical": toks == cont, "len": len(cont), "rounds": len(acc),
                     "accepted_matches_schedule": ok_acc,
                     "first_diff": next((i for i in range(min(len(toks), len(cont))) if toks[i] != cont[i]), None),
                     "keep_values_seen": sorted(set(acc))})
-        print(f"[forced] {r['name']}: identical={res[-1]['tokens_identical']} rounds={len(acc)} "
+        print(f"[{key}] {r['name']}: identical={res[-1]['tokens_identical']} rounds={len(acc)} "
               f"schedule_ok={ok_acc} keep_seen={res[-1]['keep_values_seen']}", flush = True)
-    result["forced"] = res
+    result[key] = res
+
+
+def task_forced(args, models, rows, result):
+    # full windows, every number of kept drafts 0..15 up and down
+    schedule = [(k, 15) for k in list(range(16)) + list(range(15, -1, -1))]
+    _forced_run(args, models, rows, result, "forced", schedule)
+
+
+def task_windows(args, models, rows, result):
+    # windows shortened the way the confidence truncation does (1..14 drafts verified), with fewer, as many, or more
+    # drafts matching than the window holds
+    schedule = []
+    for w in range(1, 15):
+        for k in sorted({0, 1, w // 2, w - 1, w, 15}):
+            if 0 <= k <= 15:
+                schedule.append((k, w))
+    _forced_run(args, models, rows, result, "windows", schedule)
 
 
 # ----------------------------------------------------------------------------------------------------------- rollback
@@ -361,6 +382,7 @@ class Rig:
 
     @torch.inference_mode()
     def window(self, ids, table, state, start, n, history):
+        assert n > 0 and start + n <= len(ids), "window outside the token list"
         p = self.params_for(table, start, state, history)
         logits = self.target.forward(torch.tensor([ids[start:start + n]], dtype = torch.long), p)
         return p, logits
@@ -465,13 +487,186 @@ def task_rollback(args, models, rows, result):
             finally:
                 for s in states.values():
                     s.free()
+
+    # Shorter windows, what a confidence-truncated round verifies: committing w - 1 or fewer drafts of a w-row window
+    # must again not depend on the rejected tail, and match the one-at-a-time run to the same floor
+    short = []
+    for L in lens:
+        for w in (8, 5, 2):
+            for keep in range(w):
+                states = {n: cache.get_new_state() for n in "AJB"}
+                try:
+                    sA, sJ, sB = (states[n] for n in "AJB")
+                    rig.prefill(seq[:L], bt["A"], sA)
+                    pA, _ = rig.window(seq, bt["A"], sA, L, w, True)
+                    sA.rewind(w - 1 - keep)
+                    rig.draft_update(pA, bt["A"], L, lengths = [keep + 1])
+                    junk = seq[:L + 1 + keep] + [(t + 7919 + i) % vocab for i, t in enumerate(seq[L + 1 + keep:L + w])]
+                    rig.prefill(seq[:L], bt["J"], sJ)
+                    pJ, _ = rig.window(junk, bt["J"], sJ, L, w, True)
+                    sJ.rewind(w - 1 - keep)
+                    rig.draft_update(pJ, bt["J"], L, lengths = [keep + 1])
+                    rig.prefill(seq[:L], bt["B"], sB)
+                    for j in range(keep + 1):
+                        pB, _ = rig.window(seq, bt["B"], sB, L + j, 1, False)
+                        rig.draft_update(pB, bt["B"], L + j)
+                    n = L + keep + 1
+                    snaps = {k: snapshot(cache, dcache, states[k], bt[k], n) for k in "AJB"}
+                    e = {"L": L, "window": w, "keep": keep,
+                         "A_vs_J": compare_snapshots(snaps["A"], snaps["J"]),
+                         "A_vs_B": compare_snapshots(snaps["A"], snaps["B"])}
+                    short.append(e)
+                    print(f"[rollback] L={L} window={w} keep={keep} | A~J " +
+                          " ".join(f"{c} {e['A_vs_J'][c]['rel_l2']:.1e}" for c in ("gdn_conv", "gdn_state", "kv", "dkv")) +
+                          " | A~B " +
+                          " ".join(f"{c} {e['A_vs_B'][c]['rel_l2']:.1e}" for c in ("gdn_conv", "gdn_state", "kv", "dkv")),
+                          flush = True)
+                finally:
+                    for s in states.values():
+                        s.free()
+    result["rollback_short_windows"] = short
     result["rollback"] = res
     comps = ("gdn_conv", "gdn_state", "kv", "dkv")
+    # (D with keep = 0 is a single-row window that kept per-token history, which the generator never issues: it
+    # leaves the conv state outside the normalized slot, so it is left out of the D comparisons)
     result["rollback_summary"] = {
-        k: {c: max(e[k][c]["rel_l2"] for e in res) for c in comps}
+        k: {c: max(e[k][c]["rel_l2"] for e in res if e["keep"] >= 1 or k not in ("A_vs_D", "D_vs_B")) for c in comps}
         for k in ("A_vs_J", "A_vs_B", "A_vs_D", "D_vs_B")
     }
+    for k in ("A_vs_J", "A_vs_B"):
+        result["rollback_summary"]["short_windows_" + k] = {c: max(e[k][c]["rel_l2"] for e in short) for c in comps}
     print("[rollback] summary (worst rel_l2 over all cases)", json.dumps(result["rollback_summary"]), flush = True)
+
+
+# ----------------------------------------------------------------------------------------------------------- numerics
+
+
+@torch.inference_mode()
+def task_numerics(args, models, rows, result):
+    """Logits of the same teacher-forced tokens processed in windows of w rows (everything accepted) against the
+    one-token-at-a-time logits plain decoding produces: how much does the window length alone move the logits?"""
+    target, draft, gen_plain, rig = models.target, models.draft, models.gen_plain, models.rig
+    cache = rig.cache
+    seq = []
+    for r in rows[:4]:
+        cont, _, _ = run_job(gen_plain, r["ids"], 320)
+        if len(r["ids"]) + len(cont) > len(seq):
+            seq = list(r["ids"]) + cont
+    L = 48
+    N = min(144, len(seq) - L - 1)
+    table = torch.arange(0, 4, dtype = torch.int32)[None]
+
+    def run(w):
+        s = cache.get_new_state()
+        try:
+            rig.prefill(seq[:L], table, s)
+            out = []
+            pos = L
+            while pos < L + N:
+                n = min(w, L + N - pos)
+                _, lg = rig.window(seq, table, s, pos, n, n > 1)
+                if n > 1:
+                    s.rewind(0)
+                out.append(lg[0].float().cpu())
+                pos += n
+            return torch.cat(out, dim = 0)
+        finally:
+            s.free()
+
+    ref = run(1)
+    # control: the same single-row path again (run to run determinism)
+    res = {}
+    outs = {}
+    for w in (1, 2, 3, 4, 5, 8, 9, 12, 16):
+        lg = run(w)
+        outs[w] = lg
+        d = (lg - ref)
+        top = torch.topk(ref, 10, dim = -1).indices
+        dtop = d.gather(-1, top).abs()
+        p_ref = torch.log_softmax(ref, dim = -1)
+        p_w = torch.log_softmax(lg, dim = -1)
+        kl = (p_ref.exp() * (p_ref - p_w)).sum(-1)
+        top2 = torch.topk(ref, 2, dim = -1).values
+        res[w] = {
+            "argmax_flips": int((lg.argmax(-1) != ref.argmax(-1)).sum()), "positions": int(ref.shape[0]),
+            "max_abs_top10_nats": float(dtop.max()), "mean_abs_top10_nats": float(dtop.mean()),
+            "rel_l2": float(d.norm() / ref.norm()), "mean_kl_nats": float(kl.mean()), "max_kl_nats": float(kl.max()),
+            "positions_with_top2_gap_below_0.25": int(((top2[:, 0] - top2[:, 1]) < 0.25).sum()),
+        }
+        print(f"[numerics] window {w:2d}: argmax flips {res[w]['argmax_flips']}/{res[w]['positions']} "
+              f"max|d| top10 {res[w]['max_abs_top10_nats']:.3f} mean|d| {res[w]['mean_abs_top10_nats']:.4f} "
+              f"rel_l2 {res[w]['rel_l2']:.2e} KL mean {res[w]['mean_kl_nats']:.2e} max {res[w]['max_kl_nats']:.2e}",
+              flush = True)
+    # the multi-row paths against each other: is the single-row path the odd one out?
+    pair = {}
+    for a in (2, 5, 9):
+        for b in (2, 5, 9, 16):
+            if a < b:
+                d = outs[a] - outs[b]
+                pair[f"{a}_vs_{b}"] = {"rel_l2": float(d.norm() / outs[b].norm()),
+                                       "argmax_flips": int((outs[a].argmax(-1) != outs[b].argmax(-1)).sum()),
+                                       "max_abs_all_logits": float(d.abs().max())}
+    print("[numerics] multi-row windows against each other:", json.dumps(pair), flush = True)
+    res["pairwise"] = pair
+    # run-to-run determinism of the single-row and the 16-row path (same inputs, same shapes)
+    det = {}
+    for w in (1, 16):
+        again = run(w)
+        d = again - outs[w]
+        det[w] = {"bit_identical": bool((d == 0).all()), "max_abs": float(d.abs().max()),
+                  "rel_l2": float(d.norm() / outs[w].norm())}
+    print("[numerics] run-to-run:", json.dumps(det), flush = True)
+    res["determinism"] = det
+    result["numerics"] = res
+
+
+@torch.inference_mode()
+def task_explain(args, models, rows, result):
+    """Every stream of an arm that diverges from plain decoding, at its first differing position: what do the
+    single-row path (plain decoding's) and a 16-row window (the verify path's) say, given the same prefix? A drafted
+    stream is exactly the multi-row path's own greedy stream, so its token is that path's argmax."""
+    rig = models.rig
+    cache = rig.cache
+    plain = json.load(open(args.reference_tokens))["bench"]["tokens"]["plain"]
+    toks = {}
+    for f in args.explain_tokens.split(","):
+        toks.update(json.load(open(f))["bench"]["tokens"])
+    table = torch.arange(0, 4, dtype = torch.int32)[None]
+    out = {}
+    for arm in args.explain_arms.split(","):
+        res = []
+        for r, a, b in zip(rows, plain, toks[arm]):
+            n = min(len(a), len(b))
+            j = next((i for i in range(n) if a[i] != b[i]), None)
+            if j is None:
+                continue
+            full = list(r["ids"]) + a
+            pred = len(r["ids"]) + j
+            w0 = max(1, pred - 6)
+            row = pred - 1 - w0
+            s = cache.get_new_state()
+            try:
+                rig.prefill(full[:w0], table, s)
+                _, lg = rig.window(full, table, s, w0, min(16, len(full) - w0), True)
+                lg16 = lg[0, row].float().cpu()
+            finally:
+                s.free()
+            lg1 = rig.logits(full[:pred])
+            e = {"name": r["name"], "first_diff": j, "token_plain": a[j], "token_arm": b[j],
+                 "argmax_single_row": int(lg1.argmax()), "argmax_16_row": int(lg16.argmax()),
+                 "single_row_gap_plain_minus_arm": float(lg1[a[j]] - lg1[b[j]]),
+                 "window_gap_plain_minus_arm": float(lg16[a[j]] - lg16[b[j]])}
+            res.append(e)
+        out[arm] = {
+            "diverging": len(res),
+            "arm_token_is_window_argmax": sum(1 for e in res if e["argmax_16_row"] == e["token_arm"]),
+            "plain_token_is_single_row_argmax": sum(1 for e in res if e["argmax_single_row"] == e["token_plain"]),
+            "cases": res,
+        }
+        print(f"[explain] {arm}: {len(res)} diverging streams; the arm's token is the 16-row window's argmax in "
+              f"{out[arm]['arm_token_is_window_argmax']}, plain's token is the single-row argmax in "
+              f"{out[arm]['plain_token_is_single_row_argmax']}", flush = True)
+    result["explain"] = out
 
 
 # ----------------------------------------------------------------------------------------------------------- profile
@@ -533,39 +728,182 @@ def task_profile(args, models, rows, result):
 # ----------------------------------------------------------------------------------------------------------- sampled
 
 
-def task_sampled(args, models, rows, result):
-    target, draft, gen_plain, gen_spec = models.target, models.draft, models.gen_plain, models.gen_spec
+@torch.inference_mode()
+def task_rowcheck(args, models, rows, result):
+    """The logits the generator's verify pass hands the sampler for row 0 of a drafted round, against the same row
+    computed directly (prefill + a 16-row window): is the reference distribution of the sampled test the engine's?"""
+    target, rig, gen_plain, gen_spec = models.target, models.rig, models.gen_plain, models.gen_spec
+    r = next(x for x in rows if x["name"] == args.sampled_prompts.split(",")[0])
+    ids = list(r["ids"])
+    plain, _, _ = run_job(gen_plain, ids, 120)
+    ctx = ids + plain[:98]
+    table = torch.arange(0, 4, dtype = torch.int32)[None]
+    s = rig.cache.get_new_state()
+    try:
+        rig.prefill(ctx[:-1], table, s)
+        _, lg = rig.window(list(ctx[:-1]) + [ctx[-1]] * 16, table, s, len(ctx) - 1, 16, True)
+        ref = lg[0, 0].float().cpu()
+    finally:
+        s.free()
+    captured = []
+    orig_forward = target.forward
+
+    def spy(input_ids, params = None):
+        out = orig_forward(input_ids, params)
+        if input_ids.shape[-1] == 16 and input_ids.shape[0] == 1:
+            captured.append(out[0, 0].float().cpu())
+        return out
+
+    target.forward = spy
+    try:
+        for _ in range(6):
+            run_job(gen_spec, ctx, 2, CategoricalSampler(temperature = 2.0), stop = ())
+    finally:
+        target.forward = orig_forward
+    d = [float((c - ref).abs().max()) for c in captured]
+    same = [bool((c == captured[0]).all()) for c in captured]
+    result["rowcheck"] = {"verify_calls_captured": len(captured), "max_abs_vs_reference": d,
+                          "identical_to_first_capture": same}
+    print(f"[rowcheck] captured {len(captured)} 16-row verify passes; max |logit - reference| per capture: "
+          f"{[round(x, 4) for x in d]}", flush = True)
+
+
+@torch.inference_mode()
+def task_firsttoken(args, models, rows, result):
+    """A large-sample test of the first sampled token alone, against row 0 of the verify pass computed directly (the
+    generator's own row 0, bit for bit, see rowcheck): drafted jobs that ask for two tokens, and plain jobs"""
+    target, rig, gen_plain, gen_spec = models.target, models.rig, models.gen_plain, models.gen_spec
+    draft = models.draft
     draft.markov_top_k = 64
     draft.draft_conf_threshold = None
     draft.adaptive_verification = False
+    r = next(x for x in rows if x["name"] == args.sampled_prompts.split(",")[0])
+    ids = list(r["ids"])
+    plain, _, _ = run_job(gen_plain, ids, 120)
+    ctx = ids + plain[:98]
+    T, n = args.temperature, args.samples
+    table = torch.arange(0, 4, dtype = torch.int32)[None]
+    s = rig.cache.get_new_state()
+    try:
+        rig.prefill(ctx[:-1], table, s)
+        _, lg = rig.window(list(ctx[:-1]) + [ctx[-1]] * 16, table, s, len(ctx) - 1, 16, True)
+        p_window = torch.softmax(lg[0, 0].float().cpu() / T, dim = -1)
+    finally:
+        s.free()
+    p_single = torch.softmax(rig.logits(ctx) / T, dim = -1)
+
+    def sample(gen, n_new, label):
+        t0 = time.time()
+        for i in range(n):
+            gen.enqueue(Job(input_ids = torch.tensor([ctx], dtype = torch.long), max_new_tokens = n_new,
+                            sampler = CategoricalSampler(temperature = T), identifier = i, stop_conditions = [],
+                            decode_special_tokens = True))
+        first = {}
+        t_limit = time.time() + 2400
+        while gen.num_remaining_jobs():
+            if time.time() > t_limit:
+                raise RuntimeError("sampling did not finish within 2400 s")
+            for rr in gen.iterate():
+                i = rr.get("identifier")
+                if i is None:
+                    continue
+                for src in (rr, rr.get("held") or {}):
+                    if "token_ids" in src and i not in first:
+                        first[i] = int(src["token_ids"].flatten()[0])
+        cnt = torch.zeros_like(p_window, dtype = torch.long)
+        for i in range(n):
+            cnt[first[i]] += 1
+        out = {}
+        for ref_name, p in (("window", p_window), ("single_row", p_single)):
+            stat, dof, pval, kl, kl_exp = chi_square(cnt, p)
+            out[ref_name] = {"chi2": stat, "dof": dof, "p": pval, "kl": kl, "kl_expected_null": kl_exp}
+        out["secs"] = round(time.time() - t0, 1)
+        print(f"[firsttoken] {label} n={n} T={T}: {json.dumps(out)}", flush = True)
+        return out
+
+    res = {"context_tokens": len(ctx), "kl_single_vs_window": float((p_single * (p_single / p_window).log()).sum())}
+    res["plain_1_token"] = sample(gen_plain, 1, "plain, 1 token")
+    res["drafted_2_tokens"] = sample(gen_spec, 2, "drafted, 2 tokens")
+    result["firsttoken"] = res
+
+
+@torch.inference_mode()
+def task_sampled(args, models, rows, result):
+    """The sampled-decoding check. Context: a position inside a plain greedy stream where the target's distribution is
+    spread (so there is something to test), found with teacher-forced windows. n jobs sample two tokens from that
+    context at the requested temperature with the draft active; the first token over all jobs, and the second token
+    over the jobs whose first token was the most frequent one (drawn after an accepted draft or a rejection alike), are
+    tested against the distributions the verify path itself computes (16-row windows) with a chi-square test."""
+    draft, gen_plain, gen_spec, rig = models.draft, models.gen_plain, models.gen_spec, models.rig
+    draft.markov_top_k = 64
+    draft.draft_conf_threshold = None
+    draft.adaptive_verification = False
+    T = args.temperature
+    n = args.samples
+    cache = rig.cache
+    table = torch.arange(0, 4, dtype = torch.int32)[None]
+
+    def window_logits(ctx, tail):
+        """16-row window [ctx[-1]] + tail (padded): logits fp32 [16, V] after ctx, after ctx + tail[0], ..."""
+        toks = [ctx[-1]] + list(tail)
+        toks = toks + [toks[-1]] * (16 - len(toks))
+        s_ = cache.get_new_state()
+        try:
+            rig.prefill(ctx[:-1], table, s_)
+            _, lg = rig.window(list(ctx[:-1]) + toks, table, s_, len(ctx) - 1, 16, True)
+            return lg[0].float().cpu()
+        finally:
+            s_.free()
+
+    def stream_logits(full, start, count):
+        """logits predicting full[start + 1 ... start + count], teacher forced in 16-row windows"""
+        s_ = cache.get_new_state()
+        try:
+            rig.prefill(full[:start], table, s_)
+            out, pos = [], start
+            while pos < start + count:
+                m = min(16, start + count - pos)
+                _, lg = rig.window(full, table, s_, pos, m, m > 1)
+                if m > 1:
+                    s_.rewind(0)
+                out.append(lg[0].float().cpu())
+                pos += m
+            return torch.cat(out, dim = 0)
+        finally:
+            s_.free()
+
     out = []
     for name in args.sampled_prompts.split(","):
         r = next(x for x in rows if x["name"] == name)
-        ids = r["ids"]
-        n = args.samples
-        # A test needs distributions with several well populated cells: raise the temperature from the requested one
-        # until the first token and the token after the most likely first token both have >= 12 cells expecting >= 5
-        lg0 = get_logits(models.rig, ids)
-        lg1 = get_logits(models.rig, ids + [int(lg0.argmax())])
-        T = None
-        for t_try in [args.temperature] + [t for t in (1.5, 2.0, 3.0, 4.0) if t > args.temperature]:
-            c0 = (torch.softmax(lg0 / t_try, -1) * n >= 5).sum()
-            c1 = (torch.softmax(lg1 / t_try, -1) * n * float(torch.softmax(lg0 / t_try, -1).max()) >= 5).sum()
-            T = t_try
-            if c0 >= 12 and c1 >= 12:
+        ids = list(r["ids"])
+        plain, _, _ = run_job(gen_plain, ids, 320)
+        full = ids + plain
+        lgs = stream_logits(full, len(ids) - 1, len(plain) - 1)       # row j predicts plain[j]
+        # greedy text of an instruction-tuned model is mostly peaked: raise the temperature from the requested one
+        # until some position has a spread distribution (its top token below 0.6 with many well populated cells)
+        for T in [args.temperature] + [t for t in (1.5, 2.0, 3.0) if t > args.temperature]:
+            probs = torch.softmax(lgs / T, dim = -1)
+            cells = (probs * n >= 5).sum(-1)
+            top = probs.max(-1).values
+            ok = (top < 0.6) & (top > 0.2) & (cells >= 8)
+            if bool(ok.any()):
                 break
-        p0 = torch.softmax(lg0 / T, dim = -1)
-        counts1 = torch.zeros(p0.shape[-1], dtype = torch.long)
-        firsts, seconds = [], []
+        score = torch.where(ok, cells, torch.zeros_like(cells))
+        j = int(score.argmax()) if bool(ok.any()) else int(cells.argmax())
+        ctx = full[:len(ids) + j]
+        p0 = torch.softmax(window_logits(ctx, [])[0] / T, dim = -1)
         t0 = time.time()
         for i in range(n):
             gen_spec.enqueue(Job(
-                input_ids = torch.tensor([ids], dtype = torch.long), max_new_tokens = 2,
+                input_ids = torch.tensor([ctx], dtype = torch.long), max_new_tokens = 2,
                 sampler = CategoricalSampler(temperature = T),
                 stop_conditions = [], identifier = i, decode_special_tokens = True,
             ))
         toks = {i: [] for i in range(n)}
+        t_limit = time.time() + 1500
         while gen_spec.num_remaining_jobs():
+            if time.time() > t_limit:
+                raise RuntimeError("sampling did not finish within 1500 s")
             for rr in gen_spec.iterate():
                 i = rr.get("identifier")
                 if i is None:
@@ -574,21 +912,22 @@ def task_sampled(args, models, rows, result):
                     if "token_ids" in src:
                         toks[i].extend(int(x) for x in src["token_ids"].flatten().tolist())
         samples = [toks[i][:2] for i in range(n)]
-        assert all(len(s) == 2 for s in samples)
+        assert all(len(s_) == 2 for s_ in samples)
+        counts1 = torch.zeros(p0.shape[-1], dtype = torch.long)
         for a, _ in samples:
             counts1[a] += 1
         stat, dof, pval, kl, kl_exp = chi_square(counts1, p0)
-        entry = {"prompt": name, "n": n, "temperature": T, "secs": round(time.time() - t0, 1),
-                 "first_token": {"chi2": stat, "dof": dof, "p": pval, "kl": kl, "kl_expected_null": kl_exp}}
-        # the second token given the most frequent first tokens: drawn after an accepted draft or after a rejection,
-        # both must follow the target's conditional distribution
-        top_first = torch.topk(counts1, 2).indices.tolist()
+        entry = {"prompt": name, "context_tokens": len(ctx), "position_in_stream": j, "n": n, "temperature": T,
+                 "secs": round(time.time() - t0, 1),
+                 "first_token": {"chi2": stat, "dof": dof, "p": pval, "kl": kl, "kl_expected_null": kl_exp,
+                                 "p_top": float(p0.max())}}
+        # the second token given the most frequent first tokens
         cond = []
-        for c in top_first:
+        for c in torch.topk(counts1, 2).indices.tolist():
             sec = [b for a, b in samples if a == c]
-            if len(sec) < 50:
+            if len(sec) < 100:
                 continue
-            p1 = torch.softmax(get_logits(models.rig, ids + [c]) / T, dim = -1)
+            p1 = torch.softmax(window_logits(ctx, [c])[1] / T, dim = -1)
             cnt = torch.zeros_like(counts1)
             for b in sec:
                 cnt[b] += 1
@@ -596,6 +935,68 @@ def task_sampled(args, models, rows, result):
             cond.append({"first": c, "n": len(sec), "chi2": stat, "dof": dof, "p": pval, "kl": kl,
                          "kl_expected_null": kl_exp, "p_first_under_target": float(p0[c])})
         entry["second_given_first"] = cond
+
+        # Control for the test itself: the same sampler on plain decoding (no draft), whose first token comes from
+        # the single-row path, against that path's own distribution, and the drafted samples against it too
+        p0_single = torch.softmax(rig.logits(ctx) / T, dim = -1)
+        stat, dof, pval, kl, kl_exp = chi_square(counts1, p0_single)
+        entry["control_drafted_first_token_vs_single_row"] = {"chi2": stat, "dof": dof, "p": pval, "kl": kl}
+        for i in range(n):
+            gen_plain.enqueue(Job(
+                input_ids = torch.tensor([ctx], dtype = torch.long), max_new_tokens = 1,
+                sampler = CategoricalSampler(temperature = T),
+                stop_conditions = [], identifier = i, decode_special_tokens = True,
+            ))
+        ptoks = {i: [] for i in range(n)}
+        t_limit = time.time() + 900
+        while gen_plain.num_remaining_jobs():
+            if time.time() > t_limit:
+                raise RuntimeError("plain sampling did not finish within 900 s")
+            for rr in gen_plain.iterate():
+                i = rr.get("identifier")
+                if i is None:
+                    continue
+                for src in (rr, rr.get("held") or {}):
+                    if "token_ids" in src:
+                        ptoks[i].extend(int(x) for x in src["token_ids"].flatten().tolist())
+        counts_p = torch.zeros_like(counts1)
+        for i in range(n):
+            counts_p[ptoks[i][0]] += 1
+        stat, dof, pval, kl, kl_exp = chi_square(counts_p, p0_single)
+        entry["control_plain_first_token_vs_single_row"] = {"chi2": stat, "dof": dof, "p": pval, "kl": kl,
+                                                            "kl_expected_null": kl_exp}
+        stat, dof, pval, kl, kl_exp = chi_square(counts_p, p0)
+        entry["control_plain_first_token_vs_window"] = {"chi2": stat, "dof": dof, "p": pval, "kl": kl}
+        # and the drafted path asked for one token only
+        for i in range(n):
+            gen_spec.enqueue(Job(
+                input_ids = torch.tensor([ctx], dtype = torch.long), max_new_tokens = 1,
+                sampler = CategoricalSampler(temperature = T),
+                stop_conditions = [], identifier = i, decode_special_tokens = True,
+            ))
+        stoks = {i: [] for i in range(n)}
+        t_limit = time.time() + 900
+        while gen_spec.num_remaining_jobs():
+            if time.time() > t_limit:
+                raise RuntimeError("drafted sampling did not finish within 900 s")
+            for rr in gen_spec.iterate():
+                i = rr.get("identifier")
+                if i is None:
+                    continue
+                for src in (rr, rr.get("held") or {}):
+                    if "token_ids" in src:
+                        stoks[i].extend(int(x) for x in src["token_ids"].flatten().tolist())
+        counts_s1 = torch.zeros_like(counts1)
+        for i in range(n):
+            counts_s1[stoks[i][0]] += 1
+        stat, dof, pval, kl, kl_exp = chi_square(counts_s1, p0)
+        entry["control_drafted_one_token_vs_window"] = {"chi2": stat, "dof": dof, "p": pval, "kl": kl}
+        top_cells = torch.topk(p0, 12).indices.tolist()
+        entry["first_token_cells"] = [
+            {"token": c, "expected_window": round(float(p0[c]) * n, 1), "expected_single_row": round(float(p0_single[c]) * n, 1),
+             "drafted": int(counts1[c]), "drafted_one_token": int(counts_s1[c]), "plain": int(counts_p[c])}
+            for c in top_cells
+        ]
         out.append(entry)
         print(f"[sampled] {json.dumps(entry)}", flush = True)
     result["sampled"] = out
@@ -622,6 +1023,8 @@ def main():
     ap.add_argument("--samples", type = int, default = 2000)
     ap.add_argument("--temperature", type = float, default = 1.0)
     ap.add_argument("--keep-tokens", action = "store_true")
+    ap.add_argument("--explain-tokens", default = "", help = "comma separated result JSONs (with --keep-tokens) whose arms the explain task analyses")
+    ap.add_argument("--explain-arms", default = "k64")
     ap.add_argument("--reference-tokens", default = None, help = "result JSON of an earlier run with --keep-tokens: its plain "
                     "arm is the stream the arms are compared with when this run has no plain arm")
     ap.add_argument("--out", default = None)
@@ -653,32 +1056,26 @@ def main():
     dcache_spec = Cache(draft, max_num_tokens = args.cache_tokens)
     cache_rb = Cache(target, max_num_tokens = 20 * 256, max_batch_size = 5, max_history = 15)
     dcache_rb = Cache(draft, max_num_tokens = 20 * 256)
-    cache_ctl = Cache(target, max_num_tokens = args.cache_tokens, max_batch_size = args.batch) \
-        if "plainc" in args.arms else None
     target.load(device, progressbar = False)
     draft.load(device, progressbar = False)
     tok = Tokenizer.from_config(tcfg)
     print(f"loaded in {time.time() - t0:.0f}s", flush = True)
 
     gen_plain = Generator(model = target, cache = cache_plain, tokenizer = tok, max_batch_size = args.batch)
-    gen_plain_chunk = None
-    if "plainc" in args.arms:
-        # numerical control: the same plain decoding with the prompt prefilled in different chunks
-        gen_plain_chunk = Generator(model = target, cache = cache_ctl, tokenizer = tok, max_batch_size = args.batch,
-                                    max_chunk_size = 64)
     gen_spec = Generator(model = target, cache = cache_spec, tokenizer = tok, max_batch_size = args.batch,
                          draft_model = draft, draft_cache = dcache_spec, num_draft_tokens = 15, record_draft_stats = True)
     profile_ids = []
     for r in json.load(open(args.prompts))["rows"]:
         profile_ids += r["ids"]
     models = SimpleNamespace(target = target, draft = draft, tok = tok, gen_plain = gen_plain, gen_spec = gen_spec,
-                             gen_plain_chunk = gen_plain_chunk, profile = None, profile_ids = profile_ids[:600],
+                             profile = None, profile_ids = profile_ids[:600],
                              rig = Rig(target, draft, cache_rb, dcache_rb))
 
     result = {"target": os.path.basename(os.path.normpath(args.target)), "draft": os.path.basename(os.path.normpath(args.draft)),
               "prompts": len(rows), "cache_tokens": args.cache_tokens}
     tasks = {"bench": task_bench, "forced": task_forced, "rollback": task_rollback, "sampled": task_sampled,
-             "profile": task_profile}
+             "profile": task_profile, "windows": task_windows, "numerics": task_numerics, "explain": task_explain, "rowcheck": task_rowcheck,
+             "firsttoken": task_firsttoken}
     for t in args.tasks.split(","):
         t1 = time.time()
         try:

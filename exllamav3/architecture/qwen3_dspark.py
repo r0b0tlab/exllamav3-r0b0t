@@ -65,7 +65,9 @@ Generation (Qwen3DSparkModel.sample_from_state):
   against the full-vocabulary walk at K = 64, -6% at 32, -9% at 16) by the DFlash2 selector-walk kernels.
 - The proposals are greedy, so verification by sample-and-compare is exact for greedy and for sampled decoding.
 - The confidence head is exported through params["draft_conf"] (dynamic_draft_tokens) and, when draft_conf_threshold
-  is set, as params["draft_confidence_len"]; neither changes the output, only how many drafts are verified.
+  or adaptive_verification is set, as params["draft_confidence_len"] (the number of drafts worth verifying: leading
+  confidences above the threshold, or the count that maximizes expected tokens per unit of time under a cost model
+  of a round); neither changes the output, only how many drafts are verified.
 
 TODO(calibrated): a calibrated arm needs Hessians from real target taps. Approach: accumulate x^T x over ~1k target
 sequences for (a) the 5 concatenated taps (fc), (b) the hidden_norm output (k/v of all 5 layers) and (c) the block
