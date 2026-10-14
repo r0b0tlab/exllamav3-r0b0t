@@ -1,4 +1,4 @@
-# r0b0tlab/exllamav3 — community fork
+# r0b0tlab/exllamav3-r0b0t — community fork
 
 An MIT-licensed community fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3),
 maintained for EXL3 **serving performance** work that is too invasive or too specific for upstream.
@@ -12,6 +12,9 @@ engine.
 | --- | --- |
 | `community` | **the fork.** Tracking branch for everything we maintain. |
 | `master` | clean mirror of upstream `master`. Never commit here; it is the sync point. |
+| `minicpm-v4.7` | MiniCPM-V-4.7 text-path loader for plain decoding, on ExLlamaV3 v1.5.0. Commit `4d083d25c1a3`; the plain MiniCPM-V-4.7 EXL3 pack is measured and documented on this commit. |
+| `minicpm-v4.7-dspark` | the same loader plus DSpark block-drafter support, for drafted decoding. Commit `5ddae7d12448`, pinned by the drafted profile of the serving repository (v2.1.0 and later). |
+| `gb10` | single-node GB10 run support (optional remote import; runs without trellis files). Commit `44636f06`. |
 | `dflash2-pathway`, `dflash2-pathway-backup` | superseded. Upstream `dev` landed its own native DFlash2 (CUDA kernels in `exllamav3_ext/dflash2.cu`, `architecture/dflash2.py`, `tests/test_dflash2.py`). Our PR was declined on the grounds that upstream's implementation is better, which it is. Do not build on these. |
 
 `community` is based on upstream **`dev`**, not `master`, because upstream's live work (DFlash2,
