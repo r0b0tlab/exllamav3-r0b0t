@@ -68,7 +68,7 @@ generator = Generator(
 | --- | --- |
 | `Cache(..., max_history = 15)` | recurrent targets only: snapshots kept per verify pass (>= `num_draft_tokens`) |
 | `num_draft_tokens` | drafts verified per round, 1 to 15 (the block always runs at its full size) |
-| `draft.markov_top_k` | Markov candidates per row. 8, 16 and 32 use the native top-k kernel, other values `torch.topk`. The reference measured the accepted length at -3.8% (64), -6% (32), -9% (16) against the full-vocabulary walk |
+| `draft.markov_top_k` | Markov candidates per row. 8, 16 and 32 use the native top-k kernel, other values `torch.topk`. Measured on the reference checkpoint with a torch reference (teacher-forced accepted length over 40 prompts, against the full-vocabulary walk): -3.8% (64), -6% (32), -9% (16) |
 | `draft.draft_conf_threshold` | keep only the leading drafts whose confidence is at least this; 0 drafts verified falls back to a plain step. `None` (default) verifies all |
 | `draft.adaptive_verification` | per round, verify the number of drafts that maximizes the expected accepted tokens per unit of time under a cost model of a round (needs the confidence head) |
 | `draft.set_verify_cost(costs, draft_cost)` | the cost model: the time of one verify pass over 1 .. 16 rows and of the draft side of a round, in any one unit. The default, 1 + 0.1 per extra row, is a guess for a mixture-of-experts target on a bandwidth bound device: `tools/dspark/spec_check.py --tasks profile` measures it |
@@ -90,8 +90,10 @@ the decode phase of each request; `AL` is accepted length including the bonus to
 | code | 60.4 | 199.4 (10.91) | 213.7 (10.33) | 213.6 (10.76) | 193.0 (10.62) | 191.5 (10.35) |
 | chat | 60.7 | 42.2 (2.10) | 71.5 (1.93) | 70.0 (1.70) | 41.4 (2.07) | 40.7 (2.02) |
 
-The accepted length is the draft's quality and does not depend on truncation or on the target's speed: it matches the
-reference engine's (gsm8k 8.36, code 11.29, chat 2.04) to within 4%. The speedup depends on what a verify row costs.
+The accepted length is the draft's quality and does not depend on the target's speed. The teacher-forced accepted
+length of a torch reference of this draft on the same kind of text is 4.62 over 40 prompts with the full-vocabulary
+walk (gsm8k 8.1, code 11.9, chat 2.3) and 4.43 at K = 64; the figures above are what the engine achieves on its own
+greedy streams. The speedup depends on what a verify row costs.
 
 ## Numerics
 

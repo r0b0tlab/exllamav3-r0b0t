@@ -61,8 +61,8 @@ Generation (Qwen3DSparkModel.sample_from_state):
   drafts, and the generator verifies block_size + 1 target rows (anchor + drafts). The sampler returns the ids in the
   layout [anchor, drafts...] the generator's DFlash path already consumes (it crops the leading anchor).
 - The base logits come from the target's LM head. The Markov bias markov_w1[x_{k-1}] @ markov_w2^T is evaluated for the
-  top-K base candidates of each row only (K = markov_top_k, default 64; the reference measured -3.8% accepted length
-  against the full-vocabulary walk at K = 64, -6% at 32, -9% at 16) by the DFlash2 selector-walk kernels.
+  top-K base candidates of each row only (K = markov_top_k, default 64; measured with a torch reference on the checkpoint: -3.8% accepted
+  length against the full-vocabulary walk at K = 64, -6% at 32, -9% at 16) by the DFlash2 selector-walk kernels.
 - The proposals are greedy, so verification by sample-and-compare is exact for greedy and for sampled decoding.
 - The confidence head is exported through params["draft_conf"] (dynamic_draft_tokens) and, when draft_conf_threshold
   or adaptive_verification is set, as params["draft_confidence_len"] (the number of drafts worth verifying: leading
